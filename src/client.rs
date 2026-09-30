@@ -1,6 +1,5 @@
 use std::error::Error as StdError;
 use std::io::Read;
-use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -295,7 +294,7 @@ fn inferred_https(params: &ConnectionParams) -> bool {
         .as_deref()
         .map(str::trim)
         .filter(|host| !host.is_empty() && !host.contains("://"));
-    bare_host.is_some_and(|host| tls_mode_is_unset(params) && !is_loopback_authority(host))
+    bare_host.is_some_and(|host| tls_mode_is_unset(params) && !is_localhost_authority(host))
 }
 
 fn peer_spoke_plain_http(error: &reqwest::Error) -> bool {
@@ -355,7 +354,7 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
         .ok_or_else(|| PluginError::invalid_params("Harper host is required"))?;
     let has_scheme = host.contains("://");
     let required_scheme = scheme_for(params.ssl_mode.as_deref())?;
-    let inferred_scheme = if tls_mode_is_unset(params) && is_loopback_authority(host) {
+    let inferred_scheme = if tls_mode_is_unset(params) && is_localhost_authority(host) {
         "http"
     } else {
         required_scheme
@@ -420,21 +419,11 @@ fn tls_mode_is_unset(params: &ConnectionParams) -> bool {
         .is_none_or(str::is_empty)
 }
 
-fn is_loopback_authority(authority: &str) -> bool {
+fn is_localhost_authority(authority: &str) -> bool {
     Url::parse(&format!("http://{authority}"))
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| {
-            let normalized = host.trim_end_matches('.');
-            let address = normalized
-                .strip_prefix('[')
-                .and_then(|host| host.strip_suffix(']'))
-                .unwrap_or(normalized);
-            normalized.eq_ignore_ascii_case("localhost")
-                || address
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        })
+        .is_some_and(|host| host.trim_end_matches('.').eq_ignore_ascii_case("localhost"))
 }
 
 fn scheme_for(ssl_mode: Option<&str>) -> Result<&'static str, PluginError> {
@@ -594,13 +583,13 @@ mod tests {
             build_endpoint(&params("127.0.0.2", None, None))
                 .unwrap()
                 .as_str(),
-            "http://127.0.0.2:9925/"
+            "https://127.0.0.2:9925/"
         );
         assert_eq!(
             build_endpoint(&params("[::1]", None, None))
                 .unwrap()
                 .as_str(),
-            "http://[::1]:9925/"
+            "https://[::1]:9925/"
         );
 
         let mut disabled = params("example.com", None, None);
@@ -715,8 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn bare_loopback_defaults_to_plain_http_and_reaches_operations_api() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fn bare_localhost_defaults_to_plain_http_and_reaches_operations_api() {
+        let listener = TcpListener::bind("localhost:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -730,7 +719,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let mut connection = params("127.0.0.1", None, None);
+        let mut connection = params("localhost", None, None);
         connection.port = Some(address.port());
         let client = Client::connect(connection).unwrap();
 
@@ -739,6 +728,30 @@ mod tests {
             serde_json::json!({})
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn bare_loopback_ip_keeps_https_and_explains_plain_http_opt_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let mut connection = params("127.0.0.1", None, None);
+        connection.port = Some(address.port());
+        let client = Client::connect(connection).unwrap();
+
+        let error = client.describe_all().unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.message.contains("used HTTPS"), "{}", error.message);
+        assert!(error.message.contains("SSL mode Disabled"));
+        assert!(error.message.contains("http://"));
     }
 
     #[test]

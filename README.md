@@ -88,7 +88,7 @@ Harper documents may have different fields in every row. The plugin discovers al
 
 ## TLS
 
-The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. A bare host defaults to HTTPS, except loopback names and addresses such as `localhost`, `127.0.0.1`, and `::1`, which default to HTTP for local Harper development. Use an explicit `http://` URL or select Disabled for any other intentionally unencrypted connection, and only on a trusted network because Basic-auth credentials will be sent unencrypted. Preferred/required/verification modes force HTTPS, including on loopback, and an explicit `http://` host is rejected for those modes. Custom CA, client certificate, and client key files are rejected until the plugin can apply them to its Rust TLS client; they are never silently ignored, so self-signed HTTPS endpoints require a publicly trusted certificate for now.
+The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. A bare host defaults to HTTPS, except the local development name `localhost`, which defaults to HTTP. Loopback IP addresses still default to HTTPS because Tabularis also uses them for tunneled remote connections. Use an explicit `http://` URL or select Disabled for any other intentionally unencrypted connection, and only on a trusted network because Basic-auth credentials will be sent unencrypted. Preferred/required/verification modes force HTTPS, including on `localhost`, and an explicit `http://` host is rejected for those modes. Custom CA, client certificate, and client key files are rejected until the plugin can apply them to its Rust TLS client; they are never silently ignored, so self-signed HTTPS endpoints require a publicly trusted certificate for now.
 
 ## Publishing
 
