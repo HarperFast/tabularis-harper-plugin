@@ -119,9 +119,19 @@ fn client(params: &Value) -> Result<Client, PluginError> {
 }
 
 fn database(params: &Value) -> Result<String, PluginError> {
-    inner_params(params)
-        .get("database")
+    params
+        .get("schema")
         .and_then(Value::as_str)
+        .or_else(|| {
+            inner_params(params).get("database").and_then(|database| {
+                database.as_str().or_else(|| {
+                    database
+                        .as_array()
+                        .and_then(|databases| databases.first())
+                        .and_then(Value::as_str)
+                })
+            })
+        })
         .map(str::trim)
         .filter(|database| !database.is_empty())
         .map(str::to_string)
@@ -263,7 +273,31 @@ fn data_type(attribute: &Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{columns_from_description, database_names, indexes_from_description, table_list};
+    use super::{
+        columns_from_description, database, database_names, indexes_from_description, table_list,
+    };
+
+    #[test]
+    fn uses_schema_as_database_for_tabularis_multi_database_requests() {
+        let result = database(&json!({
+            "params": { "database": "" },
+            "schema": "data"
+        }))
+        .unwrap();
+
+        assert_eq!(result, "data");
+    }
+
+    #[test]
+    fn uses_primary_connection_database_without_a_per_call_selection() {
+        let result = database(&json!({
+            "params": { "database": ["data", "packages"] },
+            "schema": null
+        }))
+        .unwrap();
+
+        assert_eq!(result, "data");
+    }
 
     #[test]
     fn extracts_database_names_in_response_order() {
