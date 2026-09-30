@@ -213,7 +213,7 @@ fn database_metadata(params: &Value) -> Result<Value, PluginError> {
     client(params)?.describe_database(&database)
 }
 
-fn read_database(params: &Value) -> Result<String, PluginError> {
+pub(crate) fn read_database(params: &Value) -> Result<String, PluginError> {
     if let Some(database) = params.get("schema").and_then(non_empty_string) {
         return Ok(database.to_string());
     }

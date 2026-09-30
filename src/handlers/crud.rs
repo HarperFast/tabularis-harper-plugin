@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::client::Client;
 use crate::error::PluginError;
-use crate::handlers::metadata::{database, primary_key};
+use crate::handlers::metadata::{primary_key, read_database};
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::result_response;
 
@@ -49,7 +49,7 @@ pub fn delete_record(id: Value, params: &Value) -> Value {
 }
 
 fn insert_record_inner(params: &Value) -> Result<u64, PluginError> {
-    let database = database(params)?;
+    let database = read_database(params)?;
     let table = required_string(params, "table")?;
     let data = params
         .get("data")
@@ -64,7 +64,7 @@ fn insert_record_inner(params: &Value) -> Result<u64, PluginError> {
 }
 
 fn update_record_inner(params: &Value) -> Result<u64, PluginError> {
-    let database = database(params)?;
+    let database = read_database(params)?;
     let table = required_string(params, "table")?;
     let column = required_string(params, "col_name")?;
     let new_value = params.get("new_val").cloned().unwrap_or(Value::Null);
@@ -108,7 +108,7 @@ fn reject_tabularis_wire_values(value: &Value) -> Result<(), PluginError> {
 }
 
 fn delete_record_inner(params: &Value) -> Result<u64, PluginError> {
-    let database = database(params)?;
+    let database = read_database(params)?;
     let table = required_string(params, "table")?;
     let (identity_name, key) = row_identity(params)?;
     let client = client(params)?;

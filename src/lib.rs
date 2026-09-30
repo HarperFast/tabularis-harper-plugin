@@ -253,8 +253,7 @@ mod tests {
 
     #[test]
     fn dispatch_reuses_a_recent_primary_key_for_update_bursts() {
-        let _cache_ttl =
-            crate::handlers::crud::set_primary_key_cache_ttl_for_test(Duration::from_secs(60));
+        let _cache_ttl = crate::handlers::crud::set_primary_key_cache_ttl_for_test(Duration::MAX);
         let (host, requests, server) = server_responses(vec![
             r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"name","type":"String"}]}"#,
             r#"{"update_hashes":[5],"skipped_hashes":[]}"#,
@@ -286,6 +285,38 @@ mod tests {
         assert!(requests[0].contains(r#""operation":"describe_table""#));
         assert!(requests[1].contains(r#""operation":"update""#));
         assert!(requests[2].contains(r#""operation":"update""#));
+    }
+
+    #[test]
+    fn schema_less_grid_edits_use_the_primary_connection_database() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"name","type":"String"}]}"#,
+            r#"{"update_hashes":[5],"skipped_hashes":[]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "update_record",
+                "params": {
+                    "params": { "host": host, "database": ["data", "staging"] },
+                    "schema": null,
+                    "table": "grid_edit_database_test",
+                    "pk_map": { "id": 5 },
+                    "col_name": "name",
+                    "new_val": "Ada"
+                },
+                "id": 23
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"], 1, "{response}");
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.contains(r#""database":"data""#)));
     }
 
     #[test]
