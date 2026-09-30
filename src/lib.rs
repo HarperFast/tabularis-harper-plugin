@@ -369,6 +369,30 @@ mod tests {
     }
 
     #[test]
+    fn drop_table_if_exists_rejects_an_invalid_database_description() {
+        let (host, _requests, server) = server_responses(vec!["null"]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": "DROP TABLE IF EXISTS `data`.`person`"
+                },
+                "id": 25
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+
+        assert_eq!(response["error"]["code"], -32001, "{response}");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid database description"));
+    }
+
+    #[test]
     fn dispatch_rejects_binary_file_markers_before_any_http_request() {
         let response = handle_line(
             &json!({

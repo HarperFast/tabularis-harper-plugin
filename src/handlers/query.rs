@@ -129,23 +129,23 @@ fn normalized_statement(query: &str) -> Result<String, PluginError> {
         ));
     }
 
-    let normalized;
-    let query = match scan.semicolons.first().copied() {
+    let normalized = match scan.semicolons.first().copied() {
         Some(index) if scan.last_code_index == Some(index) => {
-            normalized = format!("{}{}", &query[..index], &query[index + 1..]);
-            normalized.trim()
+            let mut normalized = query.to_string();
+            normalized.remove(index);
+            normalized
         }
         Some(_) => {
             return Err(PluginError::invalid_params(
                 "the Harper driver accepts exactly one SQL statement",
             ));
         }
-        None => query,
+        None => query.to_string(),
     };
-    if query.is_empty() {
+    if normalized.is_empty() {
         return Err(PluginError::invalid_params("query is required"));
     }
-    Ok(query.to_string())
+    Ok(normalized)
 }
 
 fn contains_top_level_keyword(query: &str, expected: &str) -> bool {
@@ -562,7 +562,10 @@ mod tests {
         );
         assert!(normalized_statement("SELECT ';' AS punctuation").is_ok());
         assert!(normalized_statement("SELECT 1 -- owner's result").is_ok());
-        assert!(normalized_statement("SELECT 1; -- terminal semicolon").is_ok());
+        assert_eq!(
+            normalized_statement("SELECT 1; -- terminal semicolon").unwrap(),
+            "SELECT 1 -- terminal semicolon"
+        );
         assert!(normalized_statement("SELECT 1; DELETE FROM data.dog").is_err());
         assert!(normalized_statement("SELECT 1 -- '\n; DELETE FROM data.dog -- '").is_err());
         assert!(normalized_statement(r#"SELECT 'x\' AS a, '; DELETE FROM data.dog --'"#).is_err());

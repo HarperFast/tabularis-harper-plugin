@@ -72,7 +72,12 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
                 let description = client.describe_database(&database)?;
                 let exists = description
                     .as_object()
-                    .is_some_and(|tables| tables.contains_key(&table));
+                    .ok_or_else(|| {
+                        PluginError::connection(
+                            "Harper returned an invalid database description",
+                        )
+                    })?
+                    .contains_key(&table);
                 if !exists {
                     return Ok(empty_result());
                 }
