@@ -344,7 +344,12 @@ fn column_from_attribute(attribute: &Value, primary_key: Option<&str>) -> Option
         .map(Value::String)
         .unwrap_or(Value::Null);
     let data_type = data_type(attribute);
-    let is_auto_increment = is_primary && matches!(data_type.as_str(), "ANY" | "INTEGER" | "LONG");
+    let key_can_be_omitted = attribute.get("nullable").and_then(Value::as_bool) != Some(false)
+        && attribute.get("is_nullable").and_then(Value::as_bool) != Some(false)
+        && attribute.get("required").and_then(Value::as_bool) != Some(true);
+    let is_auto_increment = is_primary
+        && key_can_be_omitted
+        && matches!(data_type.as_str(), "ANY" | "INTEGER" | "LONG");
 
     Some(json!({
         "name": name,
@@ -556,6 +561,19 @@ mod tests {
         assert_eq!(result[0]["default_value"], "7");
         assert_eq!(result[0]["comment"], r#"{"source":"generated"}"#);
         assert_eq!(result[0]["is_auto_increment"], true);
+    }
+
+    #[test]
+    fn non_nullable_numeric_primary_keys_are_not_reported_as_auto_increment() {
+        let result = columns_from_description(json!({
+            "primary_key": "id",
+            "attributes": [
+                { "attribute": "id", "type": "Int", "nullable": false }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(result[0]["is_auto_increment"], false);
     }
 
     #[test]
