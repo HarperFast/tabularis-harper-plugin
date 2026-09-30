@@ -89,7 +89,7 @@ jobs:
         run: |
           STAGE=staging
           mkdir -p "$STAGE"
-          cp target/${{ matrix.target }}/release/harper-plugin${{ matrix.binary-suffix }} "$STAGE/"
+          cp target/${{ matrix.target }}/release/harper${{ matrix.binary-suffix }} "$STAGE/"
           cp .tabularium "$STAGE/"
           cp LICENSE "$STAGE/"
           if [ -d assets ]; then
@@ -99,7 +99,7 @@ jobs:
             mkdir -p "$STAGE/ui/dist"
             cp ui/dist/index.js "$STAGE/ui/dist/"
           fi
-          (cd "$STAGE" && zip -r ../harper-plugin-${{ matrix.platform-label }}.zip .)
+          (cd "$STAGE" && zip -r ../harper-${{ matrix.platform-label }}.zip .)
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -107,7 +107,7 @@ jobs:
         run: |
           $stage = "staging"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\harper-plugin${{ matrix.binary-suffix }}" $stage
+          Copy-Item "target\${{ matrix.target }}\release\harper${{ matrix.binary-suffix }}" $stage
           Copy-Item ".tabularium" $stage
           Copy-Item "LICENSE" $stage
           if (Test-Path "assets") {
@@ -117,13 +117,13 @@ jobs:
             New-Item -ItemType Directory -Force -Path "$stage\ui\dist" | Out-Null
             Copy-Item "ui\dist\index.js" "$stage\ui\dist"
           }
-          Compress-Archive -Path "$stage\*" -DestinationPath "harper-plugin-${{ matrix.platform-label }}.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath "harper-${{ matrix.platform-label }}.zip"
 
       - name: Stash artifact
         uses: actions/upload-artifact@v5
         with:
-          name: harper-plugin-${{ matrix.platform-label }}
-          path: harper-plugin-${{ matrix.platform-label }}.zip
+          name: harper-${{ matrix.platform-label }}
+          path: harper-${{ matrix.platform-label }}.zip
           retention-days: 1
 
   release:

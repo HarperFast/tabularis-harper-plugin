@@ -1,5 +1,6 @@
 # Design
 
+- Naming boundary: the repository is `tabularis-harper-plugin`, while the Cargo package, executable, release assets, manifest identity, and installed driver directory are `harper`.
 - Harper transport boundary: the private `client` module owns HTTP, authentication, endpoint validation, limits, and Harper errors; JSON-RPC handlers only adapt request and response shapes, and tests exercise the boundary through the public dispatch entry point.
 - Each JSON-RPC request creates one lightweight Harper client facade with one absolute deadline. The shared asynchronous HTTP client and its single-worker runtime stay alive for connection pooling and idle-socket maintenance; the outer deadline covers request sending and the complete response body.
 - Ordinary operations have a 105-second budget, leaving 15 seconds for response delivery inside [Tabularis's 120-second plugin-call deadline](https://github.com/TabularisDB/tabularis/blob/ff4c5e462179e053a8687c5851bd53ecf2811fc8/src-tauri/src/plugins/driver.rs#L26-L29). Connectivity probes use 15 seconds so `ping` and `test_connection` cannot stall the serial stdio queue for the full operation budget.

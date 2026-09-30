@@ -60,7 +60,7 @@ build-ui:
 [linux]
 dev-install: build
     mkdir -p ~/.local/share/tabularis/plugins/drivers/harper
-    cp target/debug/harper-plugin ~/.local/share/tabularis/plugins/drivers/harper/
+    cp target/debug/harper ~/.local/share/tabularis/plugins/drivers/harper/
     cp .tabularium ~/.local/share/tabularis/plugins/drivers/harper/
     @if [ -f ui/dist/index.js ]; then \
         mkdir -p ~/.local/share/tabularis/plugins/drivers/harper/ui/dist; \
@@ -72,7 +72,7 @@ dev-install: build
 [macos]
 dev-install: build
     mkdir -p "$HOME/Library/Application Support/tabularis/plugins/drivers/harper"
-    cp target/debug/harper-plugin "$HOME/Library/Application Support/tabularis/plugins/drivers/harper/"
+    cp target/debug/harper "$HOME/Library/Application Support/tabularis/plugins/drivers/harper/"
     cp .tabularium "$HOME/Library/Application Support/tabularis/plugins/drivers/harper/"
     @if [ -f ui/dist/index.js ]; then \
         mkdir -p "$HOME/Library/Application Support/tabularis/plugins/drivers/harper/ui/dist"; \
@@ -85,7 +85,7 @@ dev-install: build
 dev-install: build
     $dest = Join-Path $env:APPDATA "tabularis\plugins\drivers\harper"
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Copy-Item "target\debug\harper-plugin.exe" $dest
+    Copy-Item "target\debug\harper.exe" $dest
     Copy-Item ".tabularium" $dest
     if (Test-Path "ui\dist\index.js") {
         New-Item -ItemType Directory -Force -Path (Join-Path $dest "ui\dist") | Out-Null

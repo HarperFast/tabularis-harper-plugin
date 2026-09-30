@@ -1,5 +1,5 @@
 [package]
-name = "harper-plugin"
+name = "harper"
 version = "0.1.0"
 edition = "2021"
 description = "Tabularis driver plugin for Harper"

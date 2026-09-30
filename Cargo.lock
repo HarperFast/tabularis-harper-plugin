@@ -173,7 +173,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "harper-plugin"
+name = "harper"
 version = "0.1.0"
 dependencies = [
  "reqwest",

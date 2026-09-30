@@ -41,7 +41,7 @@ fn main() {
         };
         next_id += 1;
 
-        let response = harper_plugin::handle_line(&request.to_string());
+        let response = harper::handle_line(&request.to_string());
         let pretty =
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
         writeln!(out, "{pretty}").ok();

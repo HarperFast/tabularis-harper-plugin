@@ -1,6 +1,6 @@
-# Harper Driver — Tabularis Plugin
+# Harper — Tabularis Plugin
 
-Driver plugin for [Tabularis](https://github.com/TabularisDB/tabularis).
+Harper plugin for [Tabularis](https://github.com/TabularisDB/tabularis).
 Generated with `@tabularis/create-plugin`.
 
 ## Getting started

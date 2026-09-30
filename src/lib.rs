@@ -48,9 +48,12 @@ mod tests {
     use super::{handle_line, run};
 
     #[test]
-    fn manifest_uses_harper_identifier_quote() {
+    fn manifest_preserves_harper_runtime_identity() {
         let manifest: Value = serde_json::from_str(include_str!("../.tabularium")).unwrap();
 
+        assert_eq!(manifest["name"], "harper");
+        assert_eq!(manifest["engine"], "harper");
+        assert_eq!(manifest["executable"], "harper");
         assert_eq!(manifest["capabilities"]["identifier_quote"], "`");
         assert_eq!(manifest["connection_metadata"], true);
     }

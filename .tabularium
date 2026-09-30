@@ -13,7 +13,7 @@
   ],
   "default_port": 9925,
   "default_username": "",
-  "executable": "harper-plugin",
+  "executable": "harper",
   "connection_metadata": true,
   "capabilities": {
     "schemas": false,
