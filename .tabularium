@@ -21,7 +21,7 @@
     "file_based": false,
     "folder_based": false,
     "no_connection_required": false,
-    "identifier_quote": "\"",
+    "identifier_quote": "`",
     "alter_primary_key": false,
     "alter_column": false,
     "create_foreign_keys": false,

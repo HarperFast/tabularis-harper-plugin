@@ -38,6 +38,13 @@ mod tests {
     use super::{handle_line, run};
 
     #[test]
+    fn manifest_uses_harper_identifier_quote() {
+        let manifest: Value = serde_json::from_str(include_str!("../.tabularium")).unwrap();
+
+        assert_eq!(manifest["capabilities"]["identifier_quote"], "`");
+    }
+
+    #[test]
     fn stdio_loop_uses_production_dispatch() {
         let input = Cursor::new(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":4}\n");
         let mut output = Vec::new();
