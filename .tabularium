@@ -1,0 +1,42 @@
+{
+  "$schema": "https://registry.tabularis.dev/manifest.schema.json?kind=driver",
+  "name": "harper",
+  "version": "0.1.0",
+  "description": "Tabularis driver plugin for Harper",
+  "kind": "driver",
+  "engine": "harper",
+  "paradigms": [
+    "relational"
+  ],
+  "default_port": 9925,
+  "default_username": "",
+  "executable": "harper-plugin",
+  "capabilities": {
+    "schemas": false,
+    "views": false,
+    "routines": false,
+    "file_based": false,
+    "folder_based": false,
+    "no_connection_required": false,
+    "identifier_quote": "\"",
+    "alter_primary_key": false,
+    "alter_column": false,
+    "create_foreign_keys": false,
+    "manage_tables": false,
+    "readonly": true
+  },
+  "data_types": [
+    {
+      "name": "INTEGER",
+      "category": "numeric",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
+      "name": "TEXT",
+      "category": "string",
+      "requires_length": false,
+      "requires_precision": false
+    }
+  ]
+}
