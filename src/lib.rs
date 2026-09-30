@@ -33,6 +33,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
+    use std::time::Duration;
 
     use serde_json::{json, Value};
 
@@ -252,6 +253,8 @@ mod tests {
 
     #[test]
     fn dispatch_reuses_a_recent_primary_key_for_update_bursts() {
+        let _cache_ttl =
+            crate::handlers::crud::set_primary_key_cache_ttl_for_test(Duration::from_secs(60));
         let (host, requests, server) = server_responses(vec![
             r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"name","type":"String"}]}"#,
             r#"{"update_hashes":[5],"skipped_hashes":[]}"#,

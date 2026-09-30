@@ -1,5 +1,5 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -11,7 +11,25 @@ use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::result_response;
 
 const PRIMARY_KEY_CACHE_TTL: Duration = Duration::from_secs(1);
-static PRIMARY_KEY_CACHE: OnceLock<Mutex<HashMap<String, CachedPrimaryKey>>> = OnceLock::new();
+const MAX_PRIMARY_KEY_CACHE_ENTRIES: usize = 1_024;
+
+thread_local! {
+    static PRIMARY_KEY_CACHE: RefCell<HashMap<PrimaryKeyCacheKey, CachedPrimaryKey>> =
+        RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PrimaryKeyCacheKey {
+    host: Option<String>,
+    port: Option<u16>,
+    username: Option<String>,
+    ssl_mode: Option<String>,
+    ssl_ca: Option<String>,
+    ssl_cert: Option<String>,
+    ssl_key: Option<String>,
+    database: String,
+    table: String,
+}
 
 struct CachedPrimaryKey {
     name: String,
@@ -120,16 +138,22 @@ fn checked_primary_key(
             "Harper table '{database}.{table}' has no discoverable primary key"
         ))
     })?;
-    primary_key_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
+    PRIMARY_KEY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MAX_PRIMARY_KEY_CACHE_ENTRIES {
+            cache.retain(|_, cached| cached.loaded_at.elapsed() <= primary_key_cache_ttl());
+            if cache.len() >= MAX_PRIMARY_KEY_CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
             cache_key,
             CachedPrimaryKey {
                 name: primary_key.clone(),
                 loaded_at: Instant::now(),
             },
-        );
+        )
+    });
     Ok(primary_key)
 }
 
@@ -154,32 +178,70 @@ fn row_identity(params: &Value) -> Result<(String, Value), PluginError> {
     Ok((name.clone(), key.clone()))
 }
 
-fn primary_key_cache() -> &'static Mutex<HashMap<String, CachedPrimaryKey>> {
-    PRIMARY_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn cached_primary_key(cache_key: &PrimaryKeyCacheKey) -> Option<String> {
+    PRIMARY_KEY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let cached = cache
+            .get(cache_key)
+            .filter(|cached| cached.loaded_at.elapsed() <= primary_key_cache_ttl())
+            .map(|cached| cached.name.clone());
+        if cached.is_none() {
+            cache.remove(cache_key);
+        }
+        cached
+    })
 }
 
-fn cached_primary_key(cache_key: &str) -> Option<String> {
-    let mut cache = primary_key_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.retain(|_, cached| cached.loaded_at.elapsed() <= PRIMARY_KEY_CACHE_TTL);
-    cache.get(cache_key).map(|cached| cached.name.clone())
-}
-
-fn primary_key_cache_key(params: &Value, database: &str, table: &str) -> String {
+fn primary_key_cache_key(params: &Value, database: &str, table: &str) -> PrimaryKeyCacheKey {
     let connection = ConnectionParams::from_value(inner_params(params));
-    format!(
-        "{:?}|{:?}|{:?}|{:?}|{database}|{table}",
-        connection.host, connection.port, connection.username, connection.ssl_mode,
-    )
+    PrimaryKeyCacheKey {
+        host: connection.host,
+        port: connection.port,
+        username: connection.username,
+        ssl_mode: connection.ssl_mode,
+        ssl_ca: connection.ssl_ca,
+        ssl_cert: connection.ssl_cert,
+        ssl_key: connection.ssl_key,
+        database: database.to_string(),
+        table: table.to_string(),
+    }
 }
 
 pub(crate) fn invalidate_primary_key_cache(params: &Value, database: &str, table: &str) {
     let cache_key = primary_key_cache_key(params, database, table);
-    primary_key_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&cache_key);
+    PRIMARY_KEY_CACHE.with(|cache| cache.borrow_mut().remove(&cache_key));
+}
+
+#[cfg(not(test))]
+fn primary_key_cache_ttl() -> Duration {
+    PRIMARY_KEY_CACHE_TTL
+}
+
+#[cfg(test)]
+fn primary_key_cache_ttl() -> Duration {
+    TEST_PRIMARY_KEY_CACHE_TTL.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PRIMARY_KEY_CACHE_TTL: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(PRIMARY_KEY_CACHE_TTL) };
+}
+
+#[cfg(test)]
+pub(crate) struct PrimaryKeyCacheTtlGuard(Duration);
+
+#[cfg(test)]
+impl Drop for PrimaryKeyCacheTtlGuard {
+    fn drop(&mut self) {
+        TEST_PRIMARY_KEY_CACHE_TTL.with(|ttl| ttl.set(self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_primary_key_cache_ttl_for_test(ttl: Duration) -> PrimaryKeyCacheTtlGuard {
+    let previous = TEST_PRIMARY_KEY_CACHE_TTL.with(|current| current.replace(ttl));
+    PrimaryKeyCacheTtlGuard(previous)
 }
 
 pub(crate) fn exactly_one_written(
@@ -244,7 +306,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        exactly_expected_written, exactly_one_written, reject_tabularis_wire_values, row_identity,
+        exactly_expected_written, exactly_one_written, primary_key_cache_key,
+        reject_tabularis_wire_values, row_identity,
     };
 
     #[test]
@@ -281,6 +344,16 @@ mod tests {
         assert!(row_identity(&json!({ "pk_map": { "id": {} } })).is_err());
         assert!(row_identity(&json!({ "pk_map": { "id": [] } })).is_err());
         assert!(row_identity(&json!({ "pk_map": { "id": true } })).is_err());
+    }
+
+    #[test]
+    fn primary_key_cache_keys_preserve_field_boundaries() {
+        let params = json!({ "params": { "host": "localhost", "username": "tester" } });
+
+        assert_ne!(
+            primary_key_cache_key(&params, "a|b", "c"),
+            primary_key_cache_key(&params, "a", "b|c")
+        );
     }
 
     #[test]
