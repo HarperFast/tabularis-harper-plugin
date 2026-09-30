@@ -121,21 +121,25 @@ fn client(params: &Value) -> Result<Client, PluginError> {
 fn database(params: &Value) -> Result<String, PluginError> {
     params
         .get("schema")
-        .and_then(Value::as_str)
+        .and_then(non_empty_string)
         .or_else(|| {
             inner_params(params).get("database").and_then(|database| {
-                database.as_str().or_else(|| {
+                non_empty_string(database).or_else(|| {
                     database
                         .as_array()
-                        .and_then(|databases| databases.first())
-                        .and_then(Value::as_str)
+                        .and_then(|databases| databases.iter().find_map(non_empty_string))
                 })
             })
         })
-        .map(str::trim)
-        .filter(|database| !database.is_empty())
         .map(str::to_string)
         .ok_or_else(|| PluginError::invalid_params("Harper database is required"))
+}
+
+fn non_empty_string(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn table(params: &Value) -> Result<String, PluginError> {
@@ -297,6 +301,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, "data");
+    }
+
+    #[test]
+    fn ignores_empty_schema_and_database_candidates() {
+        let result = database(&json!({
+            "params": { "database": ["", "packages"] },
+            "schema": "  "
+        }))
+        .unwrap();
+
+        assert_eq!(result, "packages");
     }
 
     #[test]
