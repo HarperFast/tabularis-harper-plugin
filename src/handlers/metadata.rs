@@ -45,10 +45,12 @@ fn indexes_from_description(description: Value) -> Value {
         .as_ref()
         .map(|column| {
             vec![json!({
-                "index_name": "PRIMARY",
-                "columns": [column],
+                "name": "PRIMARY",
+                "column_name": column,
                 "is_unique": true,
                 "is_primary": true,
+                "seq_in_index": 1,
+                "is_expression": false,
             })]
         })
         .unwrap_or_default();
@@ -66,10 +68,12 @@ fn indexes_from_description(description: Value) -> Value {
                 && primary_key.as_deref() != Some(name)
             {
                 indexes.push(json!({
-                    "index_name": format!("idx_{name}"),
-                    "columns": [name],
+                    "name": format!("idx_{name}"),
+                    "column_name": name,
                     "is_unique": false,
                     "is_primary": false,
+                    "seq_in_index": 1,
+                    "is_expression": false,
                 }));
             }
         }
@@ -379,8 +383,20 @@ mod tests {
         }));
 
         assert_eq!(result.as_array().unwrap().len(), 2);
-        assert_eq!(result[0]["index_name"], "PRIMARY");
-        assert_eq!(result[1]["index_name"], "idx_email");
+        assert_eq!(
+            result[0],
+            json!({
+                "name": "PRIMARY",
+                "column_name": "id",
+                "is_unique": true,
+                "is_primary": true,
+                "seq_in_index": 1,
+                "is_expression": false,
+            })
+        );
+        assert_eq!(result[1]["name"], "idx_email");
+        assert_eq!(result[1]["column_name"], "email");
         assert_eq!(result[1]["is_unique"], false);
+        assert_eq!(result[1]["seq_in_index"], 1);
     }
 }
