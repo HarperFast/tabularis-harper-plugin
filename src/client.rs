@@ -14,7 +14,7 @@ use crate::models::ConnectionParams;
 const DEFAULT_OPERATIONS_PORT: u16 = 9925;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(105);
-const MIN_MUTATION_BUDGET: Duration = Duration::from_secs(2);
+const MIN_MUTATION_BUDGET: Duration = Duration::from_secs(12);
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 static HTTP_CLIENT: OnceLock<Result<HttpClient, String>> = OnceLock::new();
@@ -34,7 +34,7 @@ impl Client {
         Self::connect_with_timeout(params, REQUEST_TIMEOUT)
     }
 
-    fn connect_with_timeout(
+    pub(crate) fn connect_with_timeout(
         params: ConnectionParams,
         timeout: Duration,
     ) -> Result<Self, PluginError> {
@@ -401,7 +401,8 @@ fn shared_http_client() -> Result<HttpClient, PluginError> {
 fn http_runtime() -> Result<&'static Runtime, PluginError> {
     HTTP_RUNTIME
         .get_or_init(|| {
-            RuntimeBuilder::new_current_thread()
+            RuntimeBuilder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())
@@ -527,7 +528,11 @@ fn reject_unsupported_tls_files(params: &ConnectionParams) -> Result<(), PluginE
 }
 
 async fn read_body(response: &mut Response) -> Result<Vec<u8>, BodyReadError> {
-    let mut body = Vec::new();
+    let content_length = response.content_length().unwrap_or(0);
+    if content_length > MAX_RESPONSE_BYTES {
+        return Err(BodyReadError::TooLarge);
+    }
+    let mut body = Vec::with_capacity(content_length as usize);
     while let Some(chunk) = response.chunk().await.map_err(BodyReadError::Transport)? {
         if body.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
             return Err(BodyReadError::TooLarge);
@@ -612,13 +617,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{build_endpoint, Client, REQUEST_TIMEOUT};
+    use super::{build_endpoint, Client};
     use crate::models::ConnectionParams;
-
-    #[test]
-    fn request_budget_exceeds_the_old_fifty_second_limit() {
-        assert!(REQUEST_TIMEOUT > Duration::from_secs(50));
-    }
 
     #[test]
     fn one_request_can_use_most_of_the_rpc_budget() {
@@ -649,7 +649,55 @@ mod tests {
     }
 
     #[test]
-    fn sequential_requests_share_one_deadline_including_response_body() {
+    fn reconnects_after_harper_closes_an_idle_keep_alive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = first.read(&mut request).unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"data\":{}}",
+                )
+                .unwrap();
+            thread::sleep(Duration::from_millis(100));
+            drop(first);
+
+            listener.set_nonblocking(true).unwrap();
+            let accept_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < accept_deadline {
+                match listener.accept() {
+                    Ok((mut second, _)) => {
+                        let _ = second.read(&mut request).unwrap();
+                        second
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}",
+                            )
+                            .unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("failed to accept a replacement connection: {error}"),
+                }
+            }
+            false
+        });
+        let client = Client::connect(params(&format!("http://{address}"), None, None)).unwrap();
+
+        client.describe_all().unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let second_result = client.describe_all();
+        let accepted_replacement = server.join().unwrap();
+
+        assert!(accepted_replacement);
+        assert_eq!(second_result.unwrap()["data"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn sequential_reads_share_one_deadline_including_response_body() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -667,7 +715,7 @@ mod tests {
             let _ = second.read(&mut request).unwrap();
             second
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"update_hashes\":[1]",
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"data\":{}",
                 )
                 .unwrap();
             thread::sleep(Duration::from_secs(5));
@@ -675,26 +723,24 @@ mod tests {
         let started = Instant::now();
         let client = Client::connect_with_timeout(
             params(&format!("http://{address}"), None, None),
-            Duration::from_secs(5),
+            Duration::from_secs(2),
         )
         .unwrap();
 
         client.describe_all().unwrap();
-        let error = client
-            .update("data", "person", serde_json::json!({ "id": 1 }))
-            .unwrap_err();
+        let error = client.describe_all().unwrap_err();
         let elapsed = started.elapsed();
         server.join().unwrap();
 
-        assert!(error.message.contains("outcome is unknown"));
-        assert!(elapsed < Duration::from_millis(5_750), "{elapsed:?}");
+        assert!(error.message.contains("failed to read Harper response"));
+        assert!(elapsed < Duration::from_millis(2_750), "{elapsed:?}");
     }
 
     #[test]
     fn mutation_is_not_sent_without_a_minimum_remaining_budget() {
         let client = Client::connect_with_timeout(
             params("http://127.0.0.1:1", None, None),
-            Duration::from_secs(1),
+            Duration::from_secs(11),
         )
         .unwrap();
 

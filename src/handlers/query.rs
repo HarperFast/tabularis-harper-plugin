@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
@@ -13,16 +13,17 @@ const MAX_UNBOUNDED_ROWS: u64 = 10_000;
 const MAX_PAGE_SIZE: u64 = MAX_UNBOUNDED_ROWS;
 const MAX_RESULT_COLUMNS: usize = 1_000;
 const MAX_PADDING_CELLS: usize = 1_000_000;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn test_connection(id: Value, params: &Value) -> Value {
-    let result = client(params)
+    let result = client_with_timeout(params, PROBE_TIMEOUT)
         .and_then(|client| client.user_info())
         .map(|_| json!({ "success": true }));
     result_response(id, result)
 }
 
 pub fn ping(id: Value, params: &Value) -> Value {
-    let result = client(params)
+    let result = client_with_timeout(params, PROBE_TIMEOUT)
         .and_then(|client| client.health())
         .map(|_| Value::Null);
     result_response(id, result)
@@ -114,6 +115,10 @@ fn client(params: &Value) -> Result<Client, PluginError> {
     Client::connect(ConnectionParams::from_value(inner_params(params)))
 }
 
+fn client_with_timeout(params: &Value, timeout: Duration) -> Result<Client, PluginError> {
+    Client::connect_with_timeout(ConnectionParams::from_value(inner_params(params)), timeout)
+}
+
 fn statement_kind(query: &str) -> Option<&'static str> {
     let first = scan_sql(query)?.top_level_keywords.into_iter().next()?;
     ["SELECT", "INSERT", "UPDATE", "DELETE"]
@@ -159,7 +164,7 @@ fn strip_leading_comments(query: &str) -> Result<&str, PluginError> {
 fn skip_sql_separators(mut input: &str) -> Option<&str> {
     loop {
         input = input.trim_start();
-        if starts_line_comment(input) {
+        if input.starts_with("--") {
             let comment = input
                 .strip_prefix("--")
                 .expect("line comment prefix was checked");
@@ -177,12 +182,6 @@ fn skip_sql_separators(mut input: &str) -> Option<&str> {
     }
 }
 
-fn starts_line_comment(input: &str) -> bool {
-    input
-        .strip_prefix("--")
-        .is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
-}
-
 fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     let input = skip_sql_separators(input)?;
     let prefix = input.get(..keyword.len())?;
@@ -194,7 +193,7 @@ fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
         || rest.starts_with(char::is_whitespace)
         || rest.starts_with('`')
         || rest.starts_with("/*")
-        || starts_line_comment(rest))
+        || rest.starts_with("--"))
     .then_some(rest)
 }
 
@@ -693,7 +692,9 @@ mod tests {
             ("INSERT/* hint */INTO/**/data.dog (id) VALUES (1)", "INSERT"),
             ("UPDATE `data`.`dog` SET name = 'Rover'", "UPDATE"),
             ("UPDATE/* audit */data.dog SET name = 'Rover'", "UPDATE"),
+            ("UPDATE--audit\ndata.dog SET name = 'Rover'", "UPDATE"),
             ("-- scoped\nDELETE FROM data.dog WHERE id = 1", "DELETE"),
+            ("--scoped\nDELETE FROM data.dog WHERE id = 1", "DELETE"),
             ("DELETE/**/FROM/**/data.dog WHERE id = 1", "DELETE"),
         ] {
             assert!(

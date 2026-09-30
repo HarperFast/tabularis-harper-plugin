@@ -161,7 +161,7 @@ fn starts_with_ddl_prefix(input: &str, keyword: &str) -> bool {
         || rest.starts_with(char::is_whitespace)
         || rest.starts_with('`')
         || rest.starts_with("/*")
-        || starts_line_comment(rest)
+        || starts_mysql_line_comment(rest)
 }
 
 fn strip_leading_ddl_comments(mut input: &str) -> Result<&str, PluginError> {
@@ -177,7 +177,7 @@ fn strip_leading_ddl_comments(mut input: &str) -> Result<&str, PluginError> {
             input = remainder;
             continue;
         }
-        if starts_line_comment(input) {
+        if starts_mysql_line_comment(input) {
             let comment = input
                 .strip_prefix("--")
                 .expect("line comment prefix was checked");
@@ -190,7 +190,7 @@ fn strip_leading_ddl_comments(mut input: &str) -> Result<&str, PluginError> {
     }
 }
 
-fn starts_line_comment(input: &str) -> bool {
+fn starts_mysql_line_comment(input: &str) -> bool {
     input
         .strip_prefix("--")
         .is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))

@@ -45,3 +45,7 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets
+
+      - name: Build release binary
+        if: runner.os == 'Linux'
+        run: cargo build --release
