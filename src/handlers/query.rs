@@ -52,11 +52,7 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1);
-    let page_size = params
-        .get("page_size")
-        .and_then(Value::as_u64)
-        .unwrap_or(100)
-        .clamp(1, 1_000);
+    let page_size = requested_page_size(params);
     let offset = (page - 1).saturating_mul(page_size);
     let server_paged = ["limit", "offset", "fetch", "top"]
         .into_iter()
@@ -78,6 +74,15 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         elapsed,
         server_paged,
     ))
+}
+
+fn requested_page_size(params: &Value) -> u64 {
+    params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .or_else(|| params.get("page_size").and_then(Value::as_u64))
+        .unwrap_or(100)
+        .clamp(1, 1_000)
 }
 
 fn client(params: &Value) -> Result<Client, PluginError> {
@@ -284,8 +289,13 @@ fn tabularis_query_result(
     };
     let offset = (page - 1).saturating_mul(page_size);
     let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-    let has_more = server_paged && values.len() > page_size as usize;
-    if has_more {
+    let total_rows = (!server_paged).then_some(values.len());
+    let has_more = if server_paged {
+        values.len() > page_size as usize
+    } else {
+        offset.saturating_add(page_size as usize) < values.len()
+    };
+    if server_paged && has_more {
         values.truncate(page_size as usize);
     }
     let columns = collect_columns(&values);
@@ -303,10 +313,19 @@ fn tabularis_query_result(
         .take(page_size as usize)
         .map(|value| row_values(value, &columns))
         .collect::<Vec<_>>();
+    let pagination = json!({
+        "page": page,
+        "page_size": page_size,
+        "total_rows": total_rows,
+        "has_more": has_more,
+    });
 
     json!({
         "columns": columns,
         "rows": rows,
+        "affected_rows": 0,
+        "truncated": has_more,
+        "pagination": pagination,
         "total_count": total_count,
         "execution_time_ms": elapsed,
     })
@@ -357,8 +376,20 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        contains_top_level_keyword, is_single_select, normalized_select, tabularis_query_result,
+        contains_top_level_keyword, is_single_select, normalized_select, requested_page_size,
+        tabularis_query_result,
     };
+
+    #[test]
+    fn reads_current_limit_with_legacy_page_size_fallback() {
+        assert_eq!(requested_page_size(&json!({ "limit": 25 })), 25);
+        assert_eq!(
+            requested_page_size(&json!({ "limit": 25, "page_size": 50 })),
+            25
+        );
+        assert_eq!(requested_page_size(&json!({ "page_size": 50 })), 50);
+        assert_eq!(requested_page_size(&json!({})), 100);
+    }
 
     #[test]
     fn read_only_guard_allows_one_select() {
@@ -413,6 +444,17 @@ mod tests {
 
         assert_eq!(result["columns"], json!(["name", "id", "active"]));
         assert_eq!(result["rows"], json!([["Ada", 1, null], [null, 2, true]]));
+        assert_eq!(result["affected_rows"], 0);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(
+            result["pagination"],
+            json!({
+                "page": 1,
+                "page_size": 100,
+                "total_rows": 2,
+                "has_more": false,
+            })
+        );
         assert_eq!(result["total_count"], 2);
         assert_eq!(result["execution_time_ms"], 12);
     }
@@ -420,10 +462,18 @@ mod tests {
     #[test]
     fn query_result_paginates_without_rewriting_sql() {
         let response = json!([{ "id": 1 }, { "id": 2 }, { "id": 3 }]);
-        let result = tabularis_query_result(response, 2, 2, 0, false);
+        let first_page = tabularis_query_result(response.clone(), 1, 2, 0, false);
+        let second_page = tabularis_query_result(response, 2, 2, 0, false);
 
-        assert_eq!(result["rows"], json!([[3]]));
-        assert_eq!(result["total_count"], 3);
+        assert_eq!(first_page["rows"], json!([[1], [2]]));
+        assert_eq!(first_page["truncated"], true);
+        assert_eq!(first_page["pagination"]["total_rows"], 3);
+        assert_eq!(first_page["pagination"]["has_more"], true);
+        assert_eq!(second_page["rows"], json!([[3]]));
+        assert_eq!(second_page["total_count"], 3);
+        assert_eq!(second_page["truncated"], false);
+        assert_eq!(second_page["pagination"]["total_rows"], 3);
+        assert_eq!(second_page["pagination"]["has_more"], false);
     }
 
     #[test]
@@ -441,5 +491,15 @@ mod tests {
 
         assert_eq!(result["rows"], json!([[1], [2]]));
         assert_eq!(result["total_count"], 5);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["pagination"],
+            json!({
+                "page": 2,
+                "page_size": 2,
+                "total_rows": null,
+                "has_more": true,
+            })
+        );
     }
 }
