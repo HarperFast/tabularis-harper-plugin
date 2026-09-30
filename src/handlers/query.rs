@@ -5,8 +5,12 @@ use serde_json::{json, Map, Value};
 
 use crate::client::Client;
 use crate::error::PluginError;
+use crate::handlers::ddl;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{not_implemented, result_response};
+
+const MAX_UNBOUNDED_ROWS: u64 = 10_000;
+const MAX_PAGE_SIZE: u64 = 100_000;
 
 pub fn test_connection(id: Value, params: &Value) -> Value {
     let result = client(params)
@@ -38,14 +42,15 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .ok_or_else(|| PluginError::invalid_params("query is required"))?;
-    let query = normalized_select(query).ok_or_else(|| {
-        PluginError::invalid_params("this read-only driver accepts one SELECT statement at a time")
-    })?;
-    if !is_single_select(&query) {
-        return Err(PluginError::invalid_params(
-            "this read-only driver accepts one SELECT statement at a time",
-        ));
+    if let Some(result) = ddl::execute_ddl(params, query) {
+        return result;
     }
+    let query = normalized_statement(query)?;
+    let kind = statement_kind(&query).ok_or_else(|| {
+        PluginError::invalid_params(
+            "the Harper driver accepts one SELECT, INSERT, UPDATE, or DELETE statement at a time",
+        )
+    })?;
 
     let page = params
         .get("page")
@@ -53,54 +58,79 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .unwrap_or(1)
         .max(1);
     let page_size = requested_page_size(params);
-    let offset = (page - 1).saturating_mul(page_size);
-    let server_paged = ["limit", "offset", "fetch", "top"]
+    let is_select = kind == "SELECT";
+    let has_paging_clause = ["limit", "offset", "fetch", "top"]
         .into_iter()
-        .all(|keyword| !contains_top_level_keyword(&query, keyword));
-    let executed_query = if server_paged {
-        format!("{query}\nLIMIT {} OFFSET {offset}", page_size + 1)
-    } else {
-        query
+        .any(|keyword| contains_top_level_keyword(&query, keyword));
+    let server_paged = is_select && page_size.is_some() && !has_paging_clause;
+    let unbounded_capped = is_select && page_size.is_none() && !has_paging_clause;
+    let executed_query = match (page_size, server_paged, unbounded_capped) {
+        (Some(page_size), true, _) => {
+            let offset = (page - 1).saturating_mul(page_size);
+            format!("{query}\nLIMIT {} OFFSET {offset}", page_size + 1)
+        }
+        (None, _, true) => format!("{query}\nLIMIT {}", MAX_UNBOUNDED_ROWS + 1),
+        _ => query,
     };
 
     let started = Instant::now();
-    let response = client(params)?.sql(&executed_query)?;
+    let client = client(params)?;
+    let response = if is_select {
+        client.sql(&executed_query)?
+    } else {
+        client.sql_mutation(&executed_query)?
+    };
     let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
-    Ok(tabularis_query_result(
-        response,
-        page,
-        page_size,
-        elapsed,
-        server_paged,
-    ))
+    if !is_select {
+        return write_query_result(response, elapsed);
+    }
+    match page_size {
+        Some(page_size) => Ok(tabularis_query_result(
+            response,
+            page,
+            page_size,
+            elapsed,
+            server_paged,
+        )),
+        None => Ok(unbounded_query_result(response, elapsed, unbounded_capped)),
+    }
 }
 
-fn requested_page_size(params: &Value) -> u64 {
-    params
-        .get("limit")
-        .and_then(Value::as_u64)
-        .or_else(|| params.get("page_size").and_then(Value::as_u64))
-        .unwrap_or(100)
-        .clamp(1, 1_000)
+fn requested_page_size(params: &Value) -> Option<u64> {
+    if params.get("limit") == Some(&Value::Null) {
+        return None;
+    }
+    Some(
+        params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .or_else(|| params.get("page_size").and_then(Value::as_u64))
+            .unwrap_or(100)
+            .clamp(1, MAX_PAGE_SIZE),
+    )
 }
 
 fn client(params: &Value) -> Result<Client, PluginError> {
     Client::connect(ConnectionParams::from_value(inner_params(params)))
 }
 
-fn is_single_select(query: &str) -> bool {
-    query
-        .split_ascii_whitespace()
-        .next()
-        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("select"))
+fn statement_kind(query: &str) -> Option<&'static str> {
+    let first = scan_sql(query)?.top_level_keywords.into_iter().next()?;
+    ["SELECT", "INSERT", "UPDATE", "DELETE"]
+        .into_iter()
+        .find(|kind| first.eq_ignore_ascii_case(kind))
 }
 
-fn normalized_select(query: &str) -> Option<String> {
+fn normalized_statement(query: &str) -> Result<String, PluginError> {
     let query = query.trim();
-    let scan = scan_sql(query)?;
+    let scan = scan_sql(query).ok_or_else(|| {
+        PluginError::invalid_params("SQL contains an unterminated comment or quote")
+    })?;
     if scan.semicolons.len() > 1 {
-        return None;
+        return Err(PluginError::invalid_params(
+            "the Harper driver accepts exactly one SQL statement",
+        ));
     }
 
     let normalized;
@@ -109,21 +139,17 @@ fn normalized_select(query: &str) -> Option<String> {
             normalized = format!("{}{}", &query[..index], &query[index + 1..]);
             normalized.trim()
         }
-        Some(_) => return None,
+        Some(_) => {
+            return Err(PluginError::invalid_params(
+                "the Harper driver accepts exactly one SQL statement",
+            ));
+        }
         None => query,
     };
-    let keyword = query.get(..6)?;
-    if !keyword.eq_ignore_ascii_case("select") {
-        return None;
+    if query.is_empty() {
+        return Err(PluginError::invalid_params("query is required"));
     }
-    let rest = query.get(6..)?;
-    if rest.is_empty() {
-        return Some(query.to_string());
-    }
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    Some(format!("SELECT {}", rest.trim_start()))
+    Ok(query.to_string())
 }
 
 fn contains_top_level_keyword(query: &str, expected: &str) -> bool {
@@ -331,6 +357,64 @@ fn tabularis_query_result(
     })
 }
 
+fn unbounded_query_result(response: Value, elapsed: u64, cap_enforced: bool) -> Value {
+    let mut values = match response {
+        Value::Array(values) => values,
+        Value::Null => Vec::new(),
+        value => vec![value],
+    };
+    let truncated = cap_enforced && values.len() > MAX_UNBOUNDED_ROWS as usize;
+    if truncated {
+        values.truncate(MAX_UNBOUNDED_ROWS as usize);
+    }
+    let columns = collect_columns(&values);
+    let rows = values
+        .into_iter()
+        .map(|value| row_values(value, &columns))
+        .collect::<Vec<_>>();
+    json!({
+        "columns": columns,
+        "total_count": rows.len(),
+        "rows": rows,
+        "affected_rows": 0,
+        "truncated": truncated,
+        "pagination": null,
+        "execution_time_ms": elapsed,
+    })
+}
+
+fn write_query_result(response: Value, elapsed: u64) -> Result<Value, PluginError> {
+    let affected_rows = [
+        "inserted_hashes",
+        "update_hashes",
+        "deleted_hashes",
+        "upserted_hashes",
+        "put_hashes",
+    ]
+    .into_iter()
+    .find_map(|field| response.get(field).and_then(Value::as_array).map(Vec::len))
+    .or_else(|| {
+        response
+            .get("affected_rows")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+    })
+    .ok_or_else(|| {
+        PluginError::connection(
+            "Harper write response did not include a recognized affected-record count",
+        )
+    })?;
+    Ok(json!({
+        "columns": [],
+        "rows": [],
+        "affected_rows": affected_rows,
+        "truncated": false,
+        "pagination": null,
+        "total_count": 0,
+        "execution_time_ms": elapsed,
+    }))
+}
+
 fn collect_columns(values: &[Value]) -> Vec<String> {
     let mut columns = Vec::new();
     let mut seen = HashSet::new();
@@ -376,38 +460,44 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        contains_top_level_keyword, is_single_select, normalized_select, requested_page_size,
-        tabularis_query_result,
+        contains_top_level_keyword, normalized_statement, requested_page_size, statement_kind,
+        tabularis_query_result, unbounded_query_result, write_query_result, MAX_UNBOUNDED_ROWS,
     };
 
     #[test]
     fn reads_current_limit_with_legacy_page_size_fallback() {
-        assert_eq!(requested_page_size(&json!({ "limit": 25 })), 25);
+        assert_eq!(requested_page_size(&json!({ "limit": 25 })), Some(25));
         assert_eq!(
             requested_page_size(&json!({ "limit": 25, "page_size": 50 })),
-            25
+            Some(25)
         );
-        assert_eq!(requested_page_size(&json!({ "page_size": 50 })), 50);
-        assert_eq!(requested_page_size(&json!({})), 100);
+        assert_eq!(requested_page_size(&json!({ "page_size": 50 })), Some(50));
+        assert_eq!(requested_page_size(&json!({})), Some(100));
+        assert_eq!(requested_page_size(&json!({ "limit": null })), None);
     }
 
     #[test]
-    fn read_only_guard_allows_one_select() {
-        assert!(is_single_select(
-            &normalized_select(" SELECT * FROM data.dog; ").unwrap()
-        ));
+    fn accepts_one_supported_statement() {
         assert_eq!(
-            normalized_select("SELECT\n  *\nFROM data.dog").unwrap(),
-            "SELECT *\nFROM data.dog"
+            statement_kind(&normalized_statement(" SELECT * FROM data.dog; ").unwrap()),
+            Some("SELECT")
         );
-        assert!(normalized_select("SELECT ';' AS punctuation").is_some());
-        assert!(normalized_select("SELECT 1 -- owner's result").is_some());
-        assert!(normalized_select("SELECT 1; -- terminal semicolon").is_some());
-        assert!(normalized_select("SELECT 1; DELETE FROM data.dog").is_none());
-        assert!(normalized_select("SELECT 1 -- '\n; DELETE FROM data.dog -- '").is_none());
-        assert!(normalized_select(r#"SELECT 'x\' AS a, '; DELETE FROM data.dog --'"#).is_none());
-        assert!(!is_single_select("DELETE FROM data.dog"));
-        assert!(normalized_select("-- comment\nSELECT * FROM data.dog").is_none());
+        assert_eq!(
+            normalized_statement("SELECT\n  *\nFROM data.dog").unwrap(),
+            "SELECT\n  *\nFROM data.dog"
+        );
+        assert!(normalized_statement("SELECT ';' AS punctuation").is_ok());
+        assert!(normalized_statement("SELECT 1 -- owner's result").is_ok());
+        assert!(normalized_statement("SELECT 1; -- terminal semicolon").is_ok());
+        assert!(normalized_statement("SELECT 1; DELETE FROM data.dog").is_err());
+        assert!(normalized_statement("SELECT 1 -- '\n; DELETE FROM data.dog -- '").is_err());
+        assert!(normalized_statement(r#"SELECT 'x\' AS a, '; DELETE FROM data.dog --'"#).is_err());
+        assert_eq!(statement_kind("DELETE FROM data.dog"), Some("DELETE"));
+        assert_eq!(
+            statement_kind("-- comment\nSELECT * FROM data.dog"),
+            Some("SELECT")
+        );
+        assert_eq!(statement_kind("CREATE TABLE dog (id INT)"), None);
     }
 
     #[test]
@@ -501,5 +591,30 @@ mod tests {
                 "has_more": true,
             })
         );
+    }
+
+    #[test]
+    fn unbounded_results_are_capped_and_have_no_pagination() {
+        let rows = (0..=MAX_UNBOUNDED_ROWS)
+            .map(|id| json!({ "id": id }))
+            .collect();
+        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true);
+
+        assert_eq!(
+            result["rows"].as_array().unwrap().len(),
+            MAX_UNBOUNDED_ROWS as usize
+        );
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["pagination"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn write_results_use_harper_hash_arrays() {
+        let result =
+            write_query_result(json!({ "update_hashes": [1, 2], "skipped_hashes": [] }), 4)
+                .unwrap();
+        assert_eq!(result["affected_rows"], 2);
+        assert_eq!(result["rows"], json!([]));
+        assert!(write_query_result(json!({ "message": "ok" }), 0).is_err());
     }
 }

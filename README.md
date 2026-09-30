@@ -21,11 +21,12 @@ Then open Tabularis — the Harper driver appears in the connection picker.
 | `get_schemas`, `get_foreign_keys` | implemented | return `[]`; Harper databases are selected as databases and the driver does not expose foreign keys |
 | `get_views*`, `get_routines*` | stub | return empty results while their capabilities remain disabled |
 | `create_view`, `alter_view`, `drop_view` | `-32601` | not implemented — flip `capabilities.views` once these are wired |
-| `execute_query` | implemented | accepts one `SELECT` statement and converts Harper JSON rows to the Tabularis grid shape |
+| `execute_query` | implemented | accepts one `SELECT`, `INSERT`, `UPDATE`, or `DELETE`; supported Tabularis DDL is translated to native Harper operations |
 | `explain_query` | `-32601` | Harper does not currently expose an explain operation through this driver |
-| `insert_record`, `update_record`, `delete_record` | `-32601` | the initial driver is deliberately read-only |
-| DDL generators | `-32601` | implement when table management is enabled |
-| Schema snapshot and batch metadata methods | stub | return empty results; the standard per-table metadata path is implemented |
+| `insert_record`, `update_record`, `delete_record` | implemented | uses native Harper operations; update/delete verify the table's real primary key first |
+| Create/drop table, add/drop attribute | implemented | maps Tabularis SQL previews to Harper schema operations |
+| Alter attribute, named index mutation, foreign keys | unsupported | Harper has no atomic Operations API equivalent; the plugin returns a precise error instead of approximating the mutation |
+| Schema snapshot and batch metadata methods | implemented | loads a database description once and returns Tabularis's current metadata shapes |
 
 ## Layout
 
@@ -42,9 +43,6 @@ src/
 │   ├── query.rs       test_connection, ping, execute_query, explain_query
 │   ├── crud.rs        insert_record, update_record, delete_record
 │   └── ddl.rs         CREATE/ALTER/DROP generators
-├── utils/
-│   ├── identifiers.rs quote_identifier(name) + tests
-│   └── pagination.rs  paginate(query, page, size) + tests
 └── bin/
     └── test_plugin.rs local REPL for simulating Tabularis calls
 ```
@@ -65,11 +63,25 @@ just repl
 # > get_databases
 # > get_tables
 # > query SELECT * FROM data.dog
+# > query UPDATE data.dog SET name = 'Rover' WHERE id = 1
 ```
 
 The REPL also accepts a complete JSON-RPC request on one line. It calls the same production dispatch path as the shipped plugin; credentials are read from the environment and are not printed.
 
-Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results.
+Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results. Tabularis's **All** mode fetches at most 10,000 rows and sets `truncated: true` when more rows exist, preventing an oversized response from failing after a full scan.
+
+## Harper-specific behavior
+
+- Table creation uses Harper's schema-defined attributes. Declared types and nullability are enforced by current Harper versions, and inserts do not create undeclared attributes automatically.
+- Dropping an attribute from a schema-defined table removes it from the schema but current Harper does not purge that property from already stored records. Re-adding the attribute can expose those stored values again; do not use attribute drop as a data-erasure workflow.
+- Adding a column supports `ANY` only. Harper's `create_attribute` operation has no type/nullability/default input, so the plugin rejects typed additions rather than reporting a type it did not enforce.
+- Harper manages per-attribute indexes. They are shown accurately, but the Operations API does not support creating/dropping user-named, unique, or compound indexes.
+- Foreign keys, views, routines, and SQL EXPLAIN are not advertised because Harper does not expose matching enforced semantics through this driver.
+- Numeric primary keys are auto-assigned by Harper; string/ID-style primary keys receive generated IDs when omitted.
+
+## TLS
+
+The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. Preferred/required/verification modes force HTTPS, and an explicit `http://` host is rejected for those modes. Custom CA, client certificate, and client key files are rejected until the plugin can apply them to its Rust TLS client; they are never silently ignored.
 
 ## Publishing
 

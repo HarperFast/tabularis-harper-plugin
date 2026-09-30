@@ -31,6 +31,7 @@ pub fn run(reader: impl BufRead, mut writer: impl Write) -> io::Result<()> {
 mod tests {
     use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
     use std::thread;
 
     use serde_json::{json, Value};
@@ -63,7 +64,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             let body = r#"[{"name":"Ada","id":1}]"#;
             write!(
                 stream,
@@ -93,7 +94,238 @@ mod tests {
         assert_eq!(response["id"], 5);
     }
 
-    fn read_request(stream: &mut impl Read) {
+    #[test]
+    fn dispatch_caps_unbounded_queries_without_tabularis_pagination() {
+        let (host, requests, server) = server_responses(vec![r#"[{"id":1}]"#]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host },
+                    "query": "SELECT * FROM data.person",
+                    "page": 1,
+                    "limit": null
+                },
+                "id": 12
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"]["pagination"], Value::Null);
+        assert_eq!(response["result"]["truncated"], false);
+        assert!(requests[0].contains("SELECT * FROM data.person\\nLIMIT 10001"));
+    }
+
+    #[test]
+    fn dispatch_inserts_one_record_through_native_harper_operation() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"inserted_hashes":["new-id"],"skipped_hashes":[]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "insert_record",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "table": "person",
+                    "data": { "name": "Ada" }
+                },
+                "id": 6
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"], 1);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(
+            r#"{"operation":"insert","database":"data","table":"person","records":[{"name":"Ada"}]}"#
+        ));
+    }
+
+    #[test]
+    fn dispatch_rejects_non_primary_row_identity_before_mutation() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"owner_id","type":"Int"}]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "delete_record",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "table": "person",
+                    "pk_map": { "owner_id": 5 }
+                },
+                "id": 7
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("primary key 'id'"));
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(r#"{"operation":"describe_table"#));
+    }
+
+    #[test]
+    fn dispatch_rejects_primary_key_edits_before_mutation() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"}]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "update_record",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "table": "person",
+                    "pk_map": { "id": 5 },
+                    "col_name": "id",
+                    "new_val": 6
+                },
+                "id": 13
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be edited"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_reports_skipped_single_row_write_as_an_error() {
+        let (host, _requests, server) = server_responses(vec![
+            r#"{"inserted_hashes":[],"skipped_hashes":["existing"]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "insert_record",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "table": "person",
+                    "data": { "id": "existing" }
+                },
+                "id": 8
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not affect exactly one record"));
+    }
+
+    #[test]
+    fn dispatch_schema_snapshot_uses_one_database_description() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"person":{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"name","type":"String"}]}}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "get_schema_snapshot",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "schema": null
+                },
+                "id": 9
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(response["result"][0]["name"], "person");
+        assert_eq!(response["result"][0]["columns"][0]["name"], "id");
+        assert_eq!(response["result"][0]["foreign_keys"], json!([]));
+    }
+
+    #[test]
+    fn generated_create_table_executes_one_native_schema_operation() {
+        let generated = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "get_create_table_sql",
+                "params": {
+                    "params": { "host": "unused", "database": "data" },
+                    "table_name": "person",
+                    "columns": [
+                        { "name": "id", "data_type": "INTEGER", "is_pk": true, "is_nullable": false, "is_auto_increment": true, "default_value": null },
+                        { "name": "name", "data_type": "TEXT", "is_pk": false, "is_nullable": true, "is_auto_increment": false, "default_value": null }
+                    ]
+                },
+                "id": 10
+            })
+            .to_string(),
+        );
+        let statement = generated["result"][0].as_str().unwrap();
+        let (host, requests, server) = server_responses(vec![r#"{"message":"table created"}"#]);
+        let executed = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": statement
+                },
+                "id": 11
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(executed["result"]["affected_rows"], 0);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(r#""operation":"create_table""#));
+        assert!(requests[0].contains(r#""primary_key":"id""#));
+        assert!(requests[0].contains(r#""type":"Int""#));
+        assert!(requests[0].contains(r#""type":"String""#));
+    }
+
+    #[test]
+    fn host_drop_table_sql_executes_native_harper_drop() {
+        let (host, requests, server) =
+            server_responses(vec![r#"{"message":"successfully deleted table"}"#]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": ["data", "staging"] },
+                    "query": "DROP TABLE `staging`.`person`"
+                },
+                "id": 14
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"]["affected_rows"], 0);
+        assert!(requests[0]
+            .contains(r#"{"operation":"drop_table","database":"staging","table":"person"}"#));
+    }
+
+    fn read_request(stream: &mut impl Read) -> String {
         let mut request = Vec::new();
         let mut chunk = [0; 4096];
         let header_end = loop {
@@ -117,5 +349,29 @@ mod tests {
             assert!(read > 0);
             request.extend_from_slice(&chunk[..read]);
         }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn server_responses(
+        responses: Vec<&'static str>,
+    ) -> (String, Receiver<Vec<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            sender.send(requests).unwrap();
+        });
+        (format!("http://{address}"), receiver, server)
     }
 }

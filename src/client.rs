@@ -99,6 +99,128 @@ impl Client {
         }))
     }
 
+    pub fn sql_mutation(&self, sql: &str) -> Result<Value, PluginError> {
+        self.mutation(
+            "SQL mutation",
+            json!({
+                "operation": "sql",
+                "sql": sql,
+            }),
+        )
+    }
+
+    pub fn insert(&self, database: &str, table: &str, record: Value) -> Result<Value, PluginError> {
+        self.mutation(
+            "insert",
+            json!({
+                "operation": "insert",
+                "database": database,
+                "table": table,
+                "records": [record],
+            }),
+        )
+    }
+
+    pub fn update(&self, database: &str, table: &str, record: Value) -> Result<Value, PluginError> {
+        self.mutation(
+            "update",
+            json!({
+                "operation": "update",
+                "database": database,
+                "table": table,
+                "records": [record],
+            }),
+        )
+    }
+
+    pub fn delete(&self, database: &str, table: &str, key: Value) -> Result<Value, PluginError> {
+        self.mutation(
+            "delete",
+            json!({
+                "operation": "delete",
+                "database": database,
+                "table": table,
+                "hash_values": [key],
+            }),
+        )
+    }
+
+    pub fn create_table(
+        &self,
+        database: &str,
+        table: &str,
+        primary_key: &str,
+        attributes: Vec<Value>,
+    ) -> Result<Value, PluginError> {
+        self.mutation(
+            "create_table",
+            json!({
+                "operation": "create_table",
+                "database": database,
+                "table": table,
+                "primary_key": primary_key,
+                "attributes": attributes,
+            }),
+        )
+    }
+
+    pub fn create_attribute(
+        &self,
+        database: &str,
+        table: &str,
+        attribute: &str,
+    ) -> Result<Value, PluginError> {
+        self.mutation(
+            "create_attribute",
+            json!({
+                "operation": "create_attribute",
+                "database": database,
+                "table": table,
+                "attribute": attribute,
+            }),
+        )
+    }
+
+    pub fn drop_table(&self, database: &str, table: &str) -> Result<Value, PluginError> {
+        self.mutation(
+            "drop_table",
+            json!({
+                "operation": "drop_table",
+                "database": database,
+                "table": table,
+            }),
+        )
+    }
+
+    pub fn drop_attribute(
+        &self,
+        database: &str,
+        table: &str,
+        attribute: &str,
+    ) -> Result<Value, PluginError> {
+        self.mutation(
+            "drop_attribute",
+            json!({
+                "operation": "drop_attribute",
+                "database": database,
+                "table": table,
+                "attribute": attribute,
+            }),
+        )
+    }
+
+    fn mutation(&self, name: &str, operation: Value) -> Result<Value, PluginError> {
+        self.operation(operation).map_err(|error| {
+            if error.message.contains("timed out") {
+                PluginError::connection(format!(
+                    "Harper {name} outcome is unknown because the request timed out; verify the database state before retrying"
+                ))
+            } else {
+                error
+            }
+        })
+    }
+
     fn operation(&self, operation: Value) -> Result<Value, PluginError> {
         let request = self.authorize(self.http.post(self.endpoint.clone()).json(&operation));
         let mut response = request
@@ -149,6 +271,7 @@ fn shared_http_client() -> Result<HttpClient, PluginError> {
 }
 
 fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
+    reject_unsupported_tls_files(params)?;
     let host = params
         .host
         .as_deref()
@@ -156,10 +279,11 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
         .filter(|host| !host.is_empty())
         .ok_or_else(|| PluginError::invalid_params("Harper host is required"))?;
     let has_scheme = host.contains("://");
+    let required_scheme = scheme_for(params.ssl_mode.as_deref())?;
     let endpoint_text = if has_scheme {
         host.to_string()
     } else {
-        format!("{}://{host}", scheme_for(params.ssl_mode.as_deref()))
+        format!("{required_scheme}://{host}")
     };
     let mut endpoint = Url::parse(&endpoint_text)
         .map_err(|error| PluginError::invalid_params(format!("invalid Harper host: {error}")))?;
@@ -184,6 +308,11 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
             "Harper host must use http or https",
         ));
     }
+    if required_scheme == "https" && endpoint.scheme() != "https" {
+        return Err(PluginError::invalid_params(
+            "the selected TLS mode requires an https Harper host",
+        ));
+    }
 
     let port = params
         .port
@@ -198,11 +327,36 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
     Ok(endpoint)
 }
 
-fn scheme_for(ssl_mode: Option<&str>) -> &'static str {
-    match ssl_mode.map(str::to_ascii_lowercase).as_deref() {
-        Some("require" | "verify-ca" | "verify-full" | "prefer") => "https",
-        _ => "http",
+fn scheme_for(ssl_mode: Option<&str>) -> Result<&'static str, PluginError> {
+    match ssl_mode.map(str::trim).filter(|mode| !mode.is_empty()) {
+        None => Ok("http"),
+        Some(mode) => match mode.to_ascii_lowercase().replace('_', "-").as_str() {
+            "disable" | "disabled" => Ok("http"),
+            "prefer" | "preferred" | "require" | "required" | "verify-ca" | "verify-full"
+            | "verify-identity" => Ok("https"),
+            _ => Err(PluginError::invalid_params(format!(
+                "unsupported Harper TLS mode '{mode}'"
+            ))),
+        },
     }
+}
+
+fn reject_unsupported_tls_files(params: &ConnectionParams) -> Result<(), PluginError> {
+    for (value, label) in [
+        (&params.ssl_ca, "CA certificate"),
+        (&params.ssl_cert, "client certificate"),
+        (&params.ssl_key, "client key"),
+    ] {
+        if value
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(PluginError::invalid_params(format!(
+                "Harper {label} files are not supported by this plugin yet"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_body(response: &mut Response) -> Result<Vec<u8>, PluginError> {
@@ -297,6 +451,62 @@ mod tests {
         let endpoint = build_endpoint(&params).unwrap();
 
         assert_eq!(endpoint.as_str(), "https://example.com:9925/");
+    }
+
+    #[test]
+    fn tabularis_tls_modes_never_downgrade_to_http() {
+        for mode in [
+            "prefer",
+            "preferred",
+            "require",
+            "required",
+            "verify-ca",
+            "verify_ca",
+            "verify-full",
+            "verify_identity",
+        ] {
+            let mut params = params("example.com", None, None);
+            params.ssl_mode = Some(mode.to_string());
+            assert_eq!(build_endpoint(&params).unwrap().scheme(), "https", "{mode}");
+        }
+
+        let mut params = params("http://example.com", None, None);
+        params.ssl_mode = Some("required".to_string());
+        assert!(build_endpoint(&params)
+            .unwrap_err()
+            .message
+            .contains("requires an https"));
+    }
+
+    #[test]
+    fn unsupported_tls_files_and_modes_fail_closed() {
+        let mut unknown_mode = params("example.com", None, None);
+        unknown_mode.ssl_mode = Some("mystery".to_string());
+        assert!(build_endpoint(&unknown_mode)
+            .unwrap_err()
+            .message
+            .contains("unsupported"));
+
+        let mut custom_ca = params("example.com", None, None);
+        custom_ca.ssl_ca = Some("/tmp/ca.pem".to_string());
+        assert!(build_endpoint(&custom_ca)
+            .unwrap_err()
+            .message
+            .contains("CA certificate"));
+    }
+
+    #[test]
+    fn insert_uses_native_harper_operation_shape() {
+        let (host, request) = server("200 OK", r#"{"inserted_hashes":[1],"skipped_hashes":[]}"#);
+        let client = Client::connect(params(&host, None, None)).unwrap();
+        client
+            .insert("data", "person", serde_json::json!({ "name": "Ada" }))
+            .unwrap();
+        let request = request.recv().unwrap();
+
+        assert!(request.contains(
+            r#"{"operation":"insert","database":"data","table":"person","records":[{"name":"Ada"}]}"#
+        ));
     }
 
     #[test]

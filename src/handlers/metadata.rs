@@ -106,23 +106,60 @@ pub fn get_routine_definition(id: Value, _params: &Value) -> Value {
     ok_response(id, Value::String(String::new()))
 }
 
-pub fn get_schema_snapshot(id: Value, _params: &Value) -> Value {
-    ok_response(id, json!([]))
+pub fn get_schema_snapshot(id: Value, params: &Value) -> Value {
+    let result = database_metadata(params).and_then(|description| {
+        let descriptions = table_descriptions(&description)?;
+        let tables = selected_table_names(params, descriptions);
+        tables
+            .into_iter()
+            .map(|name| {
+                let table = descriptions.get(&name).ok_or_else(|| {
+                    PluginError::connection(format!("Harper did not describe table '{name}'"))
+                })?;
+                Ok(json!({
+                    "name": name,
+                    "columns": columns_from_description(table.clone())?,
+                    "foreign_keys": [],
+                }))
+            })
+            .collect::<Result<Vec<_>, PluginError>>()
+            .map(Value::Array)
+    });
+    result_response(id, result)
 }
 
-pub fn get_all_columns_batch(id: Value, _params: &Value) -> Value {
-    ok_response(id, json!({}))
+pub fn get_all_columns_batch(id: Value, params: &Value) -> Value {
+    let result = database_metadata(params).and_then(|description| {
+        let descriptions = table_descriptions(&description)?;
+        let mut columns = Map::new();
+        for name in selected_table_names(params, descriptions) {
+            let table = descriptions.get(&name).ok_or_else(|| {
+                PluginError::connection(format!("Harper did not describe table '{name}'"))
+            })?;
+            columns.insert(name, columns_from_description(table.clone())?);
+        }
+        Ok(Value::Object(columns))
+    });
+    result_response(id, result)
 }
 
-pub fn get_all_foreign_keys_batch(id: Value, _params: &Value) -> Value {
-    ok_response(id, json!({}))
+pub fn get_all_foreign_keys_batch(id: Value, params: &Value) -> Value {
+    let result = database_metadata(params).and_then(|description| {
+        let descriptions = table_descriptions(&description)?;
+        let foreign_keys = selected_table_names(params, descriptions)
+            .into_iter()
+            .map(|name| (name, json!([])))
+            .collect();
+        Ok(Value::Object(foreign_keys))
+    });
+    result_response(id, result)
 }
 
 fn client(params: &Value) -> Result<Client, PluginError> {
     Client::connect(ConnectionParams::from_value(inner_params(params)))
 }
 
-fn database(params: &Value) -> Result<String, PluginError> {
+pub(crate) fn database(params: &Value) -> Result<String, PluginError> {
     params
         .get("schema")
         .and_then(non_empty_string)
@@ -139,7 +176,7 @@ fn database(params: &Value) -> Result<String, PluginError> {
         .ok_or_else(|| PluginError::invalid_params("Harper database is required"))
 }
 
-fn non_empty_string(value: &Value) -> Option<&str> {
+pub(crate) fn non_empty_string(value: &Value) -> Option<&str> {
     value
         .as_str()
         .map(str::trim)
@@ -160,6 +197,30 @@ fn table_description(params: &Value) -> Result<Value, PluginError> {
     let database = database(params)?;
     let table = table(params)?;
     client(params)?.describe_table(&database, &table)
+}
+
+fn database_metadata(params: &Value) -> Result<Value, PluginError> {
+    let database = database(params)?;
+    client(params)?.describe_database(&database)
+}
+
+fn table_descriptions(description: &Value) -> Result<&Map<String, Value>, PluginError> {
+    description
+        .as_object()
+        .ok_or_else(|| PluginError::connection("Harper returned an invalid database description"))
+}
+
+fn selected_table_names(params: &Value, available: &Map<String, Value>) -> Vec<String> {
+    let requested = params.get("tables").and_then(Value::as_array);
+    match requested {
+        Some(requested) => requested
+            .iter()
+            .filter_map(non_empty_string)
+            .filter(|name| available.contains_key(*name))
+            .map(str::to_string)
+            .collect(),
+        None => available.keys().cloned().collect(),
+    }
 }
 
 fn database_names(value: Value) -> Result<Value, PluginError> {
@@ -191,7 +252,7 @@ fn table_map(value: &Value) -> Option<&Map<String, Value>> {
     value.as_object()
 }
 
-fn columns_from_description(description: Value) -> Result<Value, PluginError> {
+pub(crate) fn columns_from_description(description: Value) -> Result<Value, PluginError> {
     let attributes = description
         .get("attributes")
         .and_then(Value::as_array)
@@ -228,22 +289,40 @@ fn column_from_attribute(attribute: &Value, primary_key: Option<&str>) -> Option
     let default_value = attribute
         .get("default_value")
         .or_else(|| attribute.get("default"))
-        .cloned()
+        .and_then(string_value)
+        .map(Value::String)
         .unwrap_or(Value::Null);
-    let comment = attribute.get("description").cloned().unwrap_or(Value::Null);
+    let comment = attribute
+        .get("description")
+        .and_then(string_value)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let data_type = data_type(attribute);
+    let is_auto_increment =
+        is_primary && matches!(data_type.as_str(), "INTEGER" | "LONG" | "FLOAT" | "BIGINT");
 
     Some(json!({
         "name": name,
-        "data_type": data_type(attribute),
+        "data_type": data_type,
         "is_nullable": is_nullable,
         "default_value": default_value,
         "is_pk": is_primary,
-        "is_auto_increment": false,
+        "is_auto_increment": is_auto_increment,
+        "is_generated": false,
+        "character_maximum_length": null,
         "comment": comment,
     }))
 }
 
-fn primary_key(description: &Value) -> Option<String> {
+fn string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        value => Some(value.to_string()),
+    }
+}
+
+pub(crate) fn primary_key(description: &Value) -> Option<String> {
     ["primary_key", "hash_attribute"]
         .into_iter()
         .find_map(|field| description.get(field))
@@ -369,6 +448,21 @@ mod tests {
         assert_eq!(result[0]["name"], "id");
         assert_eq!(result[0]["is_pk"], true);
         assert_eq!(result[1]["data_type"], "ANY");
+    }
+
+    #[test]
+    fn serializes_non_string_defaults_and_comments_for_tabularis() {
+        let result = columns_from_description(json!({
+            "primary_key": "id",
+            "attributes": [
+                { "attribute": "id", "type": "Int", "default": 7, "description": { "source": "generated" } }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(result[0]["default_value"], "7");
+        assert_eq!(result[0]["comment"], r#"{"source":"generated"}"#);
+        assert_eq!(result[0]["is_auto_increment"], true);
     }
 
     #[test]

@@ -22,13 +22,21 @@
     "folder_based": false,
     "no_connection_required": false,
     "identifier_quote": "`",
+    "sql_dialect": "mysql",
     "alter_primary_key": false,
     "alter_column": false,
     "create_foreign_keys": false,
-    "manage_tables": false,
-    "readonly": true
+    "manage_tables": true,
+    "readonly": false,
+    "supports_ssl": true
   },
   "data_types": [
+    {
+      "name": "ANY",
+      "category": "other",
+      "requires_length": false,
+      "requires_precision": false
+    },
     {
       "name": "INTEGER",
       "category": "numeric",
@@ -36,8 +44,51 @@
       "requires_precision": false
     },
     {
+      "name": "BIGINT",
+      "category": "numeric",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
+      "name": "FLOAT",
+      "category": "numeric",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
       "name": "TEXT",
       "category": "string",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
+      "name": "VARCHAR",
+      "category": "string",
+      "requires_length": true,
+      "requires_precision": false,
+      "default_length": "255"
+    },
+    {
+      "name": "BOOLEAN",
+      "category": "other",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
+      "name": "DATE",
+      "category": "date",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
+      "name": "BYTES",
+      "category": "binary",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
+      "name": "BLOB",
+      "category": "binary",
       "requires_length": false,
       "requires_precision": false
     }

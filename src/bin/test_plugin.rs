@@ -54,7 +54,7 @@ fn print_help() {
     println!("  ping                     GET /health liveness check");
     println!("  get_databases            list Harper databases");
     println!("  get_tables               list tables in HARPER_DATABASE");
-    println!("  query SELECT ...         execute a read-only SQL query");
+    println!("  query <SQL>              execute one SELECT/INSERT/UPDATE/DELETE statement");
     println!("  {{...}}                   send a complete JSON-RPC request");
     println!("  connection env: HARPER_HOST, HARPER_PORT, HARPER_DATABASE,");
     println!("                  HARPER_USERNAME, HARPER_PASSWORD, HARPER_SSL_MODE");
