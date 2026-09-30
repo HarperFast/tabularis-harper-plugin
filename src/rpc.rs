@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 
+use crate::error::PluginError;
 use crate::handlers;
 
 /// Parse one JSON-RPC line and return the response value (serialised
@@ -23,10 +24,10 @@ pub fn handle_line(line: &str) -> Value {
 
     match method.as_str() {
         "initialize" => ok_response(id, Value::Null),
-        "ping" => ok_response(id, Value::Null),
+        "ping" => handlers::query::ping(id, &params),
         "test_connection" => handlers::query::test_connection(id, &params),
 
-        // Metadata — return empty arrays so the driver loads cleanly.
+        // Metadata.
         "get_databases" => handlers::metadata::get_databases(id, &params),
         "get_schemas" => handlers::metadata::get_schemas(id, &params),
         "get_tables" => handlers::metadata::get_tables(id, &params),
@@ -46,7 +47,7 @@ pub fn handle_line(line: &str) -> Value {
         // View mutation — not implemented by default.
         "create_view" | "alter_view" | "drop_view" => not_implemented(id, &method),
 
-        // Query execution — critical but needs a real driver.
+        // Query execution.
         "execute_query" => handlers::query::execute_query(id, &params),
         "explain_query" => handlers::query::explain_query(id, &params),
 
@@ -84,10 +85,40 @@ pub fn error_response(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
+pub fn result_response(id: Value, result: Result<Value, PluginError>) -> Value {
+    match result {
+        Ok(result) => ok_response(id, result),
+        Err(error) => error_response(id, error.code, &error.message),
+    }
+}
+
 pub fn not_implemented(id: Value, method: &str) -> Value {
     error_response(
         id,
         -32601,
         &format!("method '{method}' is not implemented by this plugin yet"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{handle_line, result_response};
+    use crate::error::PluginError;
+
+    #[test]
+    fn invalid_json_returns_parse_error() {
+        let response = handle_line("{");
+        assert_eq!(response["error"]["code"], -32700);
+        assert_eq!(response["id"], json!(null));
+    }
+
+    #[test]
+    fn plugin_errors_become_json_rpc_errors() {
+        let response = result_response(json!(7), Err(PluginError::invalid_params("bad host")));
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["message"], "bad host");
+        assert_eq!(response["id"], 7);
+    }
 }

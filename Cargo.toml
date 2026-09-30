@@ -7,7 +7,8 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
 lto = true

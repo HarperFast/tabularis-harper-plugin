@@ -1,27 +1,368 @@
-//! Driver connection layer.
-//!
-//! This is where you wire the crate that actually talks to your database.
-//! For a pure example: https://github.com/TabularisDB/tabularis-duckdb-plugin
-//!
-//! The scaffolder leaves this file almost empty on purpose — your database
-//! library dictates the shape of `Client` and its methods.
+use std::io::Read;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use reqwest::blocking::{Client as HttpClient, RequestBuilder, Response};
+use reqwest::redirect::Policy;
+use reqwest::{StatusCode, Url};
+use serde_json::{json, Value};
 
 use crate::error::PluginError;
 use crate::models::ConnectionParams;
 
-#[allow(dead_code)]
+const DEFAULT_OPERATIONS_PORT: u16 = 9925;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+static HTTP_CLIENT: OnceLock<Result<HttpClient, String>> = OnceLock::new();
+
 pub struct Client {
-    // TODO: hold the real connection/pool here.
-    #[allow(dead_code)]
-    params: ConnectionParams,
+    endpoint: Url,
+    username: Option<String>,
+    password: Option<String>,
+    http: HttpClient,
 }
 
 impl Client {
-    /// Build a client from connection params. Return a PluginError on failure.
-    #[allow(dead_code)]
     pub fn connect(params: ConnectionParams) -> Result<Self, PluginError> {
-        // TODO: implement connection.
-        // For Harper Driver, replace with the real library call.
-        Ok(Self { params })
+        let endpoint = build_endpoint(&params)?;
+        let username = params.username.filter(|username| !username.is_empty());
+        let password = params.password.filter(|password| !password.is_empty());
+
+        match (&username, &password) {
+            (Some(_), None) => {
+                return Err(PluginError::invalid_params(
+                    "a password is required when a Harper username is provided",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(PluginError::invalid_params(
+                    "a username is required when a Harper password is provided",
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            endpoint,
+            username,
+            password,
+            http: shared_http_client()?,
+        })
+    }
+
+    pub fn health(&self) -> Result<(), PluginError> {
+        let url = self.endpoint.join("health").map_err(|error| {
+            PluginError::invalid_params(format!("invalid Harper health URL: {error}"))
+        })?;
+        let request = self.authorize(self.http.get(url));
+        let mut response = request.send().map_err(|error| {
+            PluginError::connection(format!("Harper health check failed: {error}"))
+        })?;
+        let status = response.status();
+        let body = read_body(&mut response)?;
+
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(http_error(status, &body))
+        }
+    }
+
+    pub fn describe_all(&self) -> Result<Value, PluginError> {
+        self.operation(json!({ "operation": "describe_all" }))
+    }
+
+    pub fn describe_database(&self, database: &str) -> Result<Value, PluginError> {
+        self.operation(json!({
+            "operation": "describe_database",
+            "database": database,
+        }))
+    }
+
+    pub fn describe_table(&self, database: &str, table: &str) -> Result<Value, PluginError> {
+        self.operation(json!({
+            "operation": "describe_table",
+            "database": database,
+            "table": table,
+        }))
+    }
+
+    pub fn sql(&self, sql: &str) -> Result<Value, PluginError> {
+        self.operation(json!({
+            "operation": "sql",
+            "sql": sql,
+        }))
+    }
+
+    fn operation(&self, operation: Value) -> Result<Value, PluginError> {
+        let request = self.authorize(self.http.post(self.endpoint.clone()).json(&operation));
+        let mut response = request
+            .send()
+            .map_err(|error| PluginError::connection(format!("Harper request failed: {error}")))?;
+        let status = response.status();
+        let body = read_body(&mut response)?;
+
+        if !status.is_success() {
+            return Err(http_error(status, &body));
+        }
+        if body.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        serde_json::from_slice(&body).map_err(|error| {
+            PluginError::connection(format!("Harper returned invalid JSON: {error}"))
+        })
+    }
+
+    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
+        match (&self.username, &self.password) {
+            (Some(username), Some(password)) => request.basic_auth(username, Some(password)),
+            _ => request,
+        }
+    }
+}
+
+fn shared_http_client() -> Result<HttpClient, PluginError> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            HttpClient::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(Policy::none())
+                .user_agent(concat!(
+                    "harper-tabularis-plugin/",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|error| {
+            PluginError::internal(format!("failed to initialize HTTP client: {error}"))
+        })
+}
+
+fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
+    let host = params
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| PluginError::invalid_params("Harper host is required"))?;
+    let has_scheme = host.contains("://");
+    let endpoint_text = if has_scheme {
+        host.to_string()
+    } else {
+        format!("{}://{host}", scheme_for(params.ssl_mode.as_deref()))
+    };
+    let mut endpoint = Url::parse(&endpoint_text)
+        .map_err(|error| PluginError::invalid_params(format!("invalid Harper host: {error}")))?;
+
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        return Err(PluginError::invalid_params(
+            "Harper credentials must use the username and password fields, not the host URL",
+        ));
+    }
+    if endpoint.query().is_some() || endpoint.fragment().is_some() {
+        return Err(PluginError::invalid_params(
+            "Harper host must not contain a query string or fragment",
+        ));
+    }
+    if endpoint.path() != "/" && !endpoint.path().is_empty() {
+        return Err(PluginError::invalid_params(
+            "Harper Operations API host must not contain a path",
+        ));
+    }
+    if endpoint.scheme() != "http" && endpoint.scheme() != "https" {
+        return Err(PluginError::invalid_params(
+            "Harper host must use http or https",
+        ));
+    }
+
+    let port = params
+        .port
+        .or_else(|| (!has_scheme).then_some(DEFAULT_OPERATIONS_PORT));
+    if let Some(port) = port {
+        endpoint
+            .set_port(Some(port))
+            .map_err(|_| PluginError::invalid_params("Harper host does not support a port"))?;
+    }
+    endpoint.set_path("/");
+
+    Ok(endpoint)
+}
+
+fn scheme_for(ssl_mode: Option<&str>) -> &'static str {
+    match ssl_mode.map(str::to_ascii_lowercase).as_deref() {
+        Some("require" | "verify-ca" | "verify-full" | "prefer") => "https",
+        _ => "http",
+    }
+}
+
+fn read_body(response: &mut Response) -> Result<Vec<u8>, PluginError> {
+    let mut body = Vec::new();
+    response
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| {
+            PluginError::connection(format!("failed to read Harper response: {error}"))
+        })?;
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(PluginError::connection(format!(
+            "Harper response exceeded the {} MiB safety limit",
+            MAX_RESPONSE_BYTES / 1024 / 1024
+        )));
+    }
+    Ok(body)
+}
+
+fn http_error(status: StatusCode, body: &[u8]) -> PluginError {
+    let detail = response_detail(body);
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    PluginError::connection(format!("Harper returned HTTP {status}{suffix}"))
+}
+
+fn response_detail(body: &[u8]) -> String {
+    let detail = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            ["error", "message", "detail", "title"]
+                .into_iter()
+                .find_map(|field| value.get(field).and_then(Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+    detail.chars().take(512).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+
+    use super::{build_endpoint, Client};
+    use crate::models::ConnectionParams;
+
+    #[test]
+    fn operation_sends_basic_auth_and_json() {
+        let (host, request) = server("200 OK", r#"{"data":{}}"#);
+        let client = Client::connect(params(&host, Some("alice"), Some("secret"))).unwrap();
+        let result = client.describe_all().unwrap();
+        let request = request.recv().unwrap();
+
+        assert_eq!(result["data"], serde_json::json!({}));
+        assert!(request.starts_with("POST / HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: basic ywxpy2u6c2vjcmv0"));
+        assert!(request.contains(r#"{"operation":"describe_all"}"#));
+    }
+
+    #[test]
+    fn health_uses_health_path() {
+        let (host, request) = server("200 OK", "healthy");
+        let client = Client::connect(params(&host, None, None)).unwrap();
+        client.health().unwrap();
+
+        assert!(request.recv().unwrap().starts_with("GET /health HTTP/1.1"));
+    }
+
+    #[test]
+    fn errors_include_status_and_harper_message_without_credentials() {
+        let (host, _request) = server("401 Unauthorized", r#"{"error":"access denied"}"#);
+        let client = Client::connect(params(&host, Some("alice"), Some("secret"))).unwrap();
+        let error = client.describe_all().unwrap_err();
+
+        assert!(error.message.contains("401 Unauthorized"));
+        assert!(error.message.contains("access denied"));
+        assert!(!error.message.contains("secret"));
+        assert!(!error.message.contains("YWxpY2U6c2VjcmV0"));
+    }
+
+    #[test]
+    fn bare_hosts_use_ssl_mode_and_default_operations_port() {
+        let mut params = params("example.com", None, None);
+        params.ssl_mode = Some("require".to_string());
+        let endpoint = build_endpoint(&params).unwrap();
+
+        assert_eq!(endpoint.as_str(), "https://example.com:9925/");
+    }
+
+    #[test]
+    fn explicit_url_keeps_its_default_port() {
+        let endpoint = build_endpoint(&params("https://example.com", None, None)).unwrap();
+        assert_eq!(endpoint.as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn host_urls_must_not_contain_credentials_or_paths() {
+        let credential_error =
+            build_endpoint(&params("http://alice:secret@example.com", None, None)).unwrap_err();
+        let path_error =
+            build_endpoint(&params("http://example.com/operations", None, None)).unwrap_err();
+
+        assert!(credential_error.message.contains("credentials"));
+        assert!(!credential_error.message.contains("secret"));
+        assert!(path_error.message.contains("must not contain a path"));
+    }
+
+    fn params(host: &str, username: Option<&str>, password: Option<&str>) -> ConnectionParams {
+        ConnectionParams {
+            host: Some(host.to_string()),
+            username: username.map(str::to_string),
+            password: password.map(str::to_string),
+            ..ConnectionParams::default()
+        }
+    }
+
+    fn server(status: &'static str, body: &'static str) -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position + 4;
+                }
+            };
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            sender.send(String::from_utf8(request).unwrap()).unwrap();
+
+            write!(
+				stream,
+				"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+				body.len()
+			)
+			.unwrap();
+        });
+
+        (format!("http://{address}"), receiver)
     }
 }
