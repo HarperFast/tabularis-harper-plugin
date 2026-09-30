@@ -82,7 +82,7 @@ Harper documents may have different fields in every row. The plugin discovers al
 - Adding a column supports `ANY` only. Harper's `create_attribute` operation has no type/nullability/default input, so the plugin rejects typed additions rather than reporting a type it did not enforce.
 - Harper manages per-attribute indexes. They are shown accurately, but the Operations API does not support creating/dropping user-named, unique, or compound indexes.
 - Foreign keys, views, routines, and SQL EXPLAIN are not advertised because Harper does not expose matching enforced semantics through this driver.
-- Numeric primary keys are auto-assigned by Harper; string/ID-style primary keys receive generated IDs when omitted.
+- INTEGER, LONG, and ANY primary keys created with auto increment are made omittable in Harper's schema so Harper can generate the key. Other primary-key types require an explicit value.
 - Grid updates and deletes support non-empty string and numeric primary keys. Composite, object, array, boolean, null, and empty-string keys are rejected before any request is sent.
 - When Tabularis omits a database selection, metadata reads use the first database configured on the connection. Row edits and destructive DDL require an explicit database when the connection lists more than one, preventing a write from being guessed into the wrong database.
 

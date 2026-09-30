@@ -344,8 +344,7 @@ fn column_from_attribute(attribute: &Value, primary_key: Option<&str>) -> Option
         .map(Value::String)
         .unwrap_or(Value::Null);
     let data_type = data_type(attribute);
-    let is_auto_increment =
-        is_primary && matches!(data_type.as_str(), "INTEGER" | "LONG" | "FLOAT" | "BIGINT");
+    let is_auto_increment = is_primary && matches!(data_type.as_str(), "ANY" | "INTEGER" | "LONG");
 
     Some(json!({
         "name": name,

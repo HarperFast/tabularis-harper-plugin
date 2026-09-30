@@ -240,18 +240,16 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
                 "Harper tables require exactly one primary key",
             ));
         }
-        if auto_increment
-            && (!is_primary || !matches!(native_type, Some("Int" | "Long" | "Float" | "BigInt")))
-        {
+        if auto_increment && (!is_primary || !matches!(native_type, None | Some("Int" | "Long"))) {
             return Err(PluginError::invalid_params(format!(
-                "auto increment is supported only for a numeric Harper primary key ('{name}')"
+                "auto increment is supported only for an INTEGER, LONG, or ANY Harper primary key ('{name}')"
             )));
         }
 
         let mut attribute = json!({
             "name": name,
             "indexed": true,
-            "nullable": nullable,
+            "nullable": nullable || auto_increment,
         });
         if let Some(native_type) = native_type {
             attribute["type"] = Value::String(native_type.to_string());
@@ -369,9 +367,10 @@ fn sanitize_generated_attributes(
             .get("auto_increment")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if auto_increment && !is_primary {
+        let native_type = attribute.get("type").and_then(Value::as_str);
+        if auto_increment && (!is_primary || !matches!(native_type, None | Some("Int" | "Long"))) {
             return Err(PluginError::invalid_params(
-                "generated Harper DDL has auto increment on a non-primary attribute",
+                "generated Harper DDL has auto increment on an unsupported primary-key type",
             ));
         }
         if is_primary {
@@ -382,7 +381,6 @@ fn sanitize_generated_attributes(
             }
             primary_key_seen = true;
         }
-        let native_type = attribute.get("type").and_then(Value::as_str);
         if native_type.is_some_and(|native_type| {
             !matches!(
                 native_type,
@@ -404,16 +402,13 @@ fn sanitize_generated_attributes(
         let mut clean = json!({
             "name": name,
             "indexed": true,
-            "nullable": nullable,
+            "nullable": nullable || auto_increment,
         });
         if let Some(native_type) = native_type {
             clean["type"] = Value::String(native_type.to_string());
         }
         if is_primary {
             clean["is_primary_key"] = Value::Bool(true);
-        }
-        if auto_increment {
-            clean["auto_increment"] = Value::Bool(true);
         }
         sanitized.push(clean);
     }
@@ -965,8 +960,36 @@ mod tests {
         let sanitized = sanitize_generated_attributes(&attributes, "id").unwrap();
 
         assert_eq!(sanitized[0]["indexed"], true);
-        assert_eq!(sanitized[0]["auto_increment"], true);
+        assert_eq!(sanitized[0]["nullable"], true);
+        assert!(sanitized[0].get("auto_increment").is_none());
         assert!(sanitized[0].get("hidden_option").is_none());
+    }
+
+    #[test]
+    fn auto_increment_uses_only_harper_generated_key_types() {
+        for data_type in ["FLOAT", "BIGINT"] {
+            let result = create_table_sql(&json!({
+                "params": { "database": "data" },
+                "table_name": "person",
+                "columns": [
+                    { "name": "id", "data_type": data_type, "is_pk": true, "is_nullable": false, "is_auto_increment": true, "default_value": null }
+                ]
+            }));
+            assert!(result
+                .unwrap_err()
+                .message
+                .contains("INTEGER, LONG, or ANY"));
+        }
+
+        let any_key = create_table_sql(&json!({
+            "params": { "database": "data" },
+            "table_name": "person",
+            "columns": [
+                { "name": "id", "data_type": "ANY", "is_pk": true, "is_nullable": false, "is_auto_increment": true, "default_value": null }
+            ]
+        }))
+        .unwrap();
+        assert!(any_key.contains("AUTO_INCREMENT"));
     }
 
     #[test]
