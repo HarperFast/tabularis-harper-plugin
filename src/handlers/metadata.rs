@@ -145,13 +145,9 @@ fn table_description(params: &Value) -> Result<Value, PluginError> {
 }
 
 fn database_names(value: Value) -> Result<Value, PluginError> {
-    let databases = value
-        .get("databases")
-        .and_then(Value::as_object)
-        .or_else(|| value.as_object())
-        .ok_or_else(|| {
-            PluginError::connection("Harper returned an invalid database description")
-        })?;
+    let databases = value.as_object().ok_or_else(|| {
+        PluginError::connection("Harper returned an invalid database description")
+    })?;
     Ok(Value::Array(
         databases.keys().cloned().map(Value::String).collect(),
     ))
@@ -174,10 +170,7 @@ fn table_list(value: Value) -> Result<Value, PluginError> {
 }
 
 fn table_map(value: &Value) -> Option<&Map<String, Value>> {
-    value
-        .get("tables")
-        .and_then(Value::as_object)
-        .or_else(|| value.as_object())
+    value.as_object()
 }
 
 fn columns_from_description(description: Value) -> Result<Value, PluginError> {
@@ -204,8 +197,9 @@ fn column_from_attribute(attribute: &Value, primary_key: Option<&str>) -> Option
         .unwrap_or(false)
         || primary_key == Some(name);
     let is_nullable = attribute
-        .get("is_nullable")
+        .get("nullable")
         .and_then(Value::as_bool)
+        .or_else(|| attribute.get("is_nullable").and_then(Value::as_bool))
         .or_else(|| {
             attribute
                 .get("required")
@@ -258,7 +252,8 @@ fn data_type(attribute: &Value) -> String {
         .to_ascii_uppercase();
     match data_type.as_str() {
         "STRING" => "TEXT".to_string(),
-        "INT" | "NUMBER" => "INTEGER".to_string(),
+        "INT" => "INTEGER".to_string(),
+        "NUMBER" => "FLOAT".to_string(),
         "OBJECT" | "ARRAY" => "JSON".to_string(),
         _ => data_type,
     }
@@ -277,17 +272,21 @@ mod tests {
     }
 
     #[test]
-    fn supports_wrapped_table_maps() {
+    fn reads_top_level_table_maps_even_when_a_table_is_named_tables() {
         let result = table_list(json!({
-            "tables": {
-                "dog": { "description": "Dogs" },
-                "owner": {}
-            }
+            "tables": { "description": "A real table" },
+            "owner": {}
         }))
         .unwrap();
-        assert_eq!(result[0]["name"], "dog");
-        assert_eq!(result[0]["comment"], "Dogs");
+        assert_eq!(result[0]["name"], "tables");
+        assert_eq!(result[0]["comment"], "A real table");
         assert_eq!(result[1]["name"], "owner");
+    }
+
+    #[test]
+    fn reads_top_level_database_maps_even_when_a_database_is_named_databases() {
+        let result = database_names(json!({ "databases": {}, "data": {} })).unwrap();
+        assert_eq!(result, json!(["databases", "data"]));
     }
 
     #[test]
@@ -296,7 +295,7 @@ mod tests {
             "primary_key": "id",
             "attributes": [
                 { "attribute": "id", "type": "integer" },
-                { "attribute": "profile", "type": "object", "required": true }
+                { "attribute": "profile", "type": "object", "nullable": false }
             ]
         }))
         .unwrap();

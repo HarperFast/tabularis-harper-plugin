@@ -56,8 +56,7 @@ impl Client {
         let url = self.endpoint.join("health").map_err(|error| {
             PluginError::invalid_params(format!("invalid Harper health URL: {error}"))
         })?;
-        let request = self.authorize(self.http.get(url));
-        let mut response = request.send().map_err(|error| {
+        let mut response = self.http.get(url).send().map_err(|error| {
             PluginError::connection(format!("Harper health check failed: {error}"))
         })?;
         let status = response.status();
@@ -72,6 +71,10 @@ impl Client {
 
     pub fn describe_all(&self) -> Result<Value, PluginError> {
         self.operation(json!({ "operation": "describe_all" }))
+    }
+
+    pub fn user_info(&self) -> Result<Value, PluginError> {
+        self.operation(json!({ "operation": "user_info" }))
     }
 
     pub fn describe_database(&self, database: &str) -> Result<Value, PluginError> {
