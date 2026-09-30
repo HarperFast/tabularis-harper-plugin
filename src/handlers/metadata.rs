@@ -160,8 +160,8 @@ fn client(params: &Value) -> Result<Client, PluginError> {
 }
 
 pub(crate) fn database(params: &Value) -> Result<String, PluginError> {
-    if let Some(database) = params.get("schema").and_then(non_empty_string) {
-        return Ok(database.to_string());
+    if let Some(database) = selected_database(params)? {
+        return Ok(database);
     }
     let database = inner_params(params).get("database");
     if let Some(database) = database.and_then(non_empty_string) {
@@ -214,8 +214,8 @@ fn database_metadata(params: &Value) -> Result<Value, PluginError> {
 }
 
 pub(crate) fn read_database(params: &Value) -> Result<String, PluginError> {
-    if let Some(database) = params.get("schema").and_then(non_empty_string) {
-        return Ok(database.to_string());
+    if let Some(database) = selected_database(params)? {
+        return Ok(database);
     }
     let database = inner_params(params).get("database");
     database
@@ -227,6 +227,19 @@ pub(crate) fn read_database(params: &Value) -> Result<String, PluginError> {
         })
         .map(str::to_string)
         .ok_or_else(|| PluginError::invalid_params("Harper database is required"))
+}
+
+fn selected_database(params: &Value) -> Result<Option<String>, PluginError> {
+    let database = params.get("database").and_then(non_empty_string);
+    let schema = params.get("schema").and_then(non_empty_string);
+    if let (Some(database), Some(schema)) = (database, schema) {
+        if database != schema {
+            return Err(PluginError::invalid_params(
+                "conflicting Harper database selections",
+            ));
+        }
+    }
+    Ok(database.or(schema).map(str::to_string))
 }
 
 fn table_descriptions(description: &Value) -> Result<&Map<String, Value>, PluginError> {
@@ -399,6 +412,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, "data");
+    }
+
+    #[test]
+    fn uses_top_level_database_for_tabularis_write_scope() {
+        let result = database(&json!({
+            "params": { "database": ["data", "staging"] },
+            "database": "staging",
+            "schema": null
+        }))
+        .unwrap();
+
+        assert_eq!(result, "staging");
+    }
+
+    #[test]
+    fn rejects_conflicting_top_level_database_and_schema() {
+        let error = database(&json!({
+            "params": { "database": ["data", "staging"] },
+            "database": "data",
+            "schema": "staging"
+        }))
+        .unwrap_err();
+
+        assert!(error.message.contains("conflicting"));
     }
 
     #[test]

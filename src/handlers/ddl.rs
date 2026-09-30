@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use serde_json::{json, Value};
 
 use crate::client::Client;
@@ -58,14 +60,24 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
         return Some(command.and_then(|command| execute_command(params, &command)));
     }
     if starts_with_keyword(query, "DROP TABLE") {
-        return Some(parse_drop_table(query).and_then(|(parsed_database, table)| {
+        return Some(parse_drop_table(query).and_then(|(parsed_database, table, if_exists)| {
             let database = parsed_database.or_else(|| database(params).ok());
             let database = database.ok_or_else(|| {
                 PluginError::invalid_params(
                     "DROP TABLE must qualify the Harper database when multiple databases are selected",
                 )
             })?;
-            client(params)?.drop_table(&database, &table)?;
+            let client = client(params)?;
+            if if_exists {
+                let description = client.describe_database(&database)?;
+                let exists = description
+                    .as_object()
+                    .is_some_and(|tables| tables.contains_key(&table));
+                if !exists {
+                    return Ok(empty_result());
+                }
+            }
+            client.drop_table(&database, &table)?;
             invalidate_primary_key_cache(params, &database, &table);
             Ok(empty_result())
         }));
@@ -296,14 +308,17 @@ fn preview_type(native_type: Option<&str>) -> &'static str {
     }
 }
 
-fn parse_drop_table(query: &str) -> Result<(Option<String>, String), PluginError> {
+fn parse_drop_table(query: &str) -> Result<(Option<String>, String, bool), PluginError> {
     let query = one_statement(query)?;
     let rest = strip_keyword(query, "DROP TABLE")
         .ok_or_else(|| PluginError::invalid_params("expected a single DROP TABLE statement"))?;
-    let rest = strip_keyword(rest, "IF EXISTS").unwrap_or(rest);
+    let (rest, if_exists) = match strip_keyword(rest, "IF EXISTS") {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
     let (database, table, rest) = parse_table_reference(rest)?;
     ensure_empty(rest)?;
-    Ok((database, table))
+    Ok((database, table, if_exists))
 }
 
 fn parse_drop_column(query: &str) -> Result<(Option<String>, String, String), PluginError> {
@@ -454,12 +469,11 @@ fn reject_host_rewritten_identifier(identifier: &str) -> Result<(), PluginError>
 fn encode_command(command: &Value, preview: &str) -> String {
     let mut command = command.clone();
     command["preview"] = Value::String(preview.to_string());
-    let encoded = command
-        .to_string()
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let command = command.to_string();
+    let mut encoded = String::with_capacity(command.len() * 2);
+    for byte in command.bytes() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
     format!("{COMMAND_PREFIX}{encoded}{COMMAND_SUFFIX}\n{preview}")
 }
 
@@ -638,7 +652,7 @@ mod tests {
     fn parses_host_generated_drop_statements() {
         assert_eq!(
             parse_drop_table("DROP TABLE `data`.`odd``table`").unwrap(),
-            (Some("data".to_string()), "odd`table".to_string())
+            (Some("data".to_string()), "odd`table".to_string(), false)
         );
         assert_eq!(
             parse_drop_column("ALTER TABLE `data`.`person` DROP COLUMN `age`").unwrap(),
@@ -650,11 +664,15 @@ mod tests {
         );
         assert_eq!(
             parse_drop_table("DROP TABLE `data`.`user;data`").unwrap(),
-            (Some("data".to_string()), "user;data".to_string())
+            (Some("data".to_string()), "user;data".to_string(), false)
         );
         assert_eq!(
             parse_drop_table("DROP TABLE résumé").unwrap(),
-            (None, "résumé".to_string())
+            (None, "résumé".to_string(), false)
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE IF EXISTS `data`.`person`").unwrap(),
+            (Some("data".to_string()), "person".to_string(), true)
         );
     }
 

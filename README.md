@@ -82,7 +82,7 @@ Harper documents may have different fields in every row. The plugin discovers al
 - Foreign keys, views, routines, and SQL EXPLAIN are not advertised because Harper does not expose matching enforced semantics through this driver.
 - Numeric primary keys are auto-assigned by Harper; string/ID-style primary keys receive generated IDs when omitted.
 - Grid updates and deletes support non-empty string and numeric primary keys. Composite, object, array, boolean, null, and empty-string keys are rejected before any request is sent.
-- When Tabularis omits a database selection, metadata and row edits consistently use the first database configured on the connection. Destructive DDL still requires an explicit database when the connection lists more than one.
+- When Tabularis omits a database selection, metadata reads use the first database configured on the connection. Row edits and destructive DDL require an explicit database when the connection lists more than one, preventing a write from being guessed into the wrong database.
 
 ## TLS
 

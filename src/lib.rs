@@ -288,7 +288,33 @@ mod tests {
     }
 
     #[test]
-    fn schema_less_grid_edits_use_the_primary_connection_database() {
+    fn ambiguous_grid_edits_fail_before_any_http_request() {
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "update_record",
+                "params": {
+                    "params": { "host": "http://127.0.0.1:1", "database": ["data", "staging"] },
+                    "schema": null,
+                    "table": "grid_edit_database_test",
+                    "pk_map": { "id": 5 },
+                    "col_name": "name",
+                    "new_val": "Ada"
+                },
+                "id": 23
+            })
+            .to_string(),
+        );
+
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one Harper database"));
+    }
+
+    #[test]
+    fn grid_edits_honor_the_top_level_selected_database() {
         let (host, requests, server) = server_responses(vec![
             r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"name","type":"String"}]}"#,
             r#"{"update_hashes":[5],"skipped_hashes":[]}"#,
@@ -299,7 +325,7 @@ mod tests {
                 "method": "update_record",
                 "params": {
                     "params": { "host": host, "database": ["data", "staging"] },
-                    "schema": null,
+                    "database": "staging",
                     "table": "grid_edit_database_test",
                     "pk_map": { "id": 5 },
                     "col_name": "name",
@@ -316,7 +342,30 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests
             .iter()
-            .all(|request| request.contains(r#""database":"data""#)));
+            .all(|request| request.contains(r#""database":"staging""#)));
+    }
+
+    #[test]
+    fn drop_table_if_exists_is_a_noop_when_the_table_is_missing() {
+        let (host, requests, server) = server_responses(vec![r#"{"other":{}}"#]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": "DROP TABLE IF EXISTS `data`.`missing`"
+                },
+                "id": 24
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"]["affected_rows"], 0, "{response}");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(r#""operation":"describe_database""#));
     }
 
     #[test]
