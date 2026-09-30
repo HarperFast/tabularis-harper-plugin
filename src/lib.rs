@@ -120,6 +120,31 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_executes_sql_mutations_through_the_writable_path() {
+        let (host, requests, server) =
+            server_responses(vec![r#"{"inserted_hashes":[1],"skipped_hashes":[]}"#]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host },
+                    "query": "INSERT INTO data.person (id, name) VALUES (1, 'Ada')"
+                },
+                "id": 21
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"]["affected_rows"], 1, "{response}");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(r#""operation":"sql""#));
+        assert!(requests[0].contains("INSERT INTO data.person"));
+    }
+
+    #[test]
     fn dispatch_inserts_one_record_through_native_harper_operation() {
         let (host, requests, server) = server_responses(vec![
             r#"{"inserted_hashes":["new-id"],"skipped_hashes":[]}"#,
@@ -198,6 +223,31 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cannot be edited"));
+    }
+
+    #[test]
+    fn dispatch_rejects_non_scalar_primary_keys_before_any_http_request() {
+        for key in [json!({}), json!([]), json!(true), Value::Null] {
+            let response = handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "delete_record",
+                    "params": {
+                        "params": { "host": "http://127.0.0.1:1", "database": "data" },
+                        "table": "non_scalar_key_test",
+                        "pk_map": { "id": key }
+                    },
+                    "id": 22
+                })
+                .to_string(),
+            );
+
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+            assert!(response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("non-empty string or number"));
+        }
     }
 
     #[test]

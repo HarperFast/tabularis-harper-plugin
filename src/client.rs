@@ -275,7 +275,7 @@ impl Client {
         let mut message = format!("{context}: {}", error_detail(error));
         if self.https_inferred && peer_spoke_plain_http(error) {
             message.push_str(
-                "; the connection used HTTPS—if this Harper server intentionally uses plain HTTP, select SSL mode Disabled or enter an explicit http:// host",
+                "; the connection used HTTPS—if this Harper server intentionally uses plain HTTP, select SSL mode Disabled or enter an explicit http:// host, but only on a trusted network because credentials will be sent unencrypted",
             );
         }
         PluginError::connection(message)

@@ -92,8 +92,8 @@ fn reject_tabularis_wire_values(value: &Value) -> Result<(), PluginError> {
 fn delete_record_inner(params: &Value) -> Result<u64, PluginError> {
     let database = database(params)?;
     let table = required_string(params, "table")?;
-    let client = client(params)?;
     let (identity_name, key) = row_identity(params)?;
+    let client = client(params)?;
     let primary_key = checked_primary_key(&client, params, &database, table)?;
     if identity_name != primary_key {
         return Err(PluginError::invalid_params(format!(
@@ -144,13 +144,14 @@ fn row_identity(params: &Value) -> Result<(String, Value), PluginError> {
         ));
     }
     let (name, key) = key_map.iter().next().expect("map length was checked");
-    let key = key.clone();
-    if key.is_null() || key.as_str().is_some_and(|key| key.trim().is_empty()) {
+    if !matches!(key, Value::Number(_))
+        && !matches!(key, Value::String(value) if !value.trim().is_empty())
+    {
         return Err(PluginError::invalid_params(
-            "Harper primary-key value cannot be null or empty",
+            "Harper primary-key value must be a non-empty string or number; composite keys are not supported",
         ));
     }
-    Ok((name.clone(), key))
+    Ok((name.clone(), key.clone()))
 }
 
 fn primary_key_cache() -> &'static Mutex<HashMap<String, CachedPrimaryKey>> {
@@ -277,6 +278,9 @@ mod tests {
         assert!(row_identity(&json!({ "pk_map": { "id": 7, "other": 8 } })).is_err());
         assert!(row_identity(&json!({ "pk_map": { "id": null } })).is_err());
         assert!(row_identity(&json!({ "pk_map": { "id": "" } })).is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": {} } })).is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": [] } })).is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": true } })).is_err());
     }
 
     #[test]
