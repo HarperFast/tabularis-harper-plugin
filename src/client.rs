@@ -1,5 +1,6 @@
 use std::error::Error as StdError;
 use std::io::Read;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -293,13 +294,8 @@ fn inferred_https(params: &ConnectionParams) -> bool {
         .host
         .as_deref()
         .map(str::trim)
-        .is_some_and(|host| !host.is_empty() && !host.contains("://"));
-    let mode_is_unset = params
-        .ssl_mode
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty);
-    bare_host && mode_is_unset
+        .filter(|host| !host.is_empty() && !host.contains("://"));
+    bare_host.is_some_and(|host| tls_mode_is_unset(params) && !is_loopback_authority(host))
 }
 
 fn peer_spoke_plain_http(error: &reqwest::Error) -> bool {
@@ -359,10 +355,15 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
         .ok_or_else(|| PluginError::invalid_params("Harper host is required"))?;
     let has_scheme = host.contains("://");
     let required_scheme = scheme_for(params.ssl_mode.as_deref())?;
+    let inferred_scheme = if tls_mode_is_unset(params) && is_loopback_authority(host) {
+        "http"
+    } else {
+        required_scheme
+    };
     let endpoint_text = if has_scheme {
         host.to_string()
     } else {
-        format!("{required_scheme}://{host}")
+        format!("{inferred_scheme}://{host}")
     };
     let mut endpoint = Url::parse(&endpoint_text)
         .map_err(|error| PluginError::invalid_params(format!("invalid Harper host: {error}")))?;
@@ -409,6 +410,31 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
     endpoint.set_path("/");
 
     Ok(endpoint)
+}
+
+fn tls_mode_is_unset(params: &ConnectionParams) -> bool {
+    params
+        .ssl_mode
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    Url::parse(&format!("http://{authority}"))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            let normalized = host.trim_end_matches('.');
+            let address = normalized
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(normalized);
+            normalized.eq_ignore_ascii_case("localhost")
+                || address
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
 }
 
 fn scheme_for(ssl_mode: Option<&str>) -> Result<&'static str, PluginError> {
@@ -558,6 +584,25 @@ mod tests {
         let endpoint = build_endpoint(&params("example.com", None, None)).unwrap();
         assert_eq!(endpoint.as_str(), "https://example.com:9925/");
 
+        assert_eq!(
+            build_endpoint(&params("localhost", None, None))
+                .unwrap()
+                .as_str(),
+            "http://localhost:9925/"
+        );
+        assert_eq!(
+            build_endpoint(&params("127.0.0.2", None, None))
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.2:9925/"
+        );
+        assert_eq!(
+            build_endpoint(&params("[::1]", None, None))
+                .unwrap()
+                .as_str(),
+            "http://[::1]:9925/"
+        );
+
         let mut disabled = params("example.com", None, None);
         disabled.ssl_mode = Some("disabled".to_string());
         assert_eq!(
@@ -586,12 +631,19 @@ mod tests {
             assert_eq!(build_endpoint(&params).unwrap().scheme(), "https", "{mode}");
         }
 
-        let mut params = params("http://example.com", None, None);
-        params.ssl_mode = Some("required".to_string());
-        assert!(build_endpoint(&params)
+        let mut explicit_http = params("http://example.com", None, None);
+        explicit_http.ssl_mode = Some("required".to_string());
+        assert!(build_endpoint(&explicit_http)
             .unwrap_err()
             .message
             .contains("requires an https"));
+
+        let mut localhost = params("localhost", None, None);
+        localhost.ssl_mode = Some("required".to_string());
+        assert_eq!(
+            build_endpoint(&localhost).unwrap().as_str(),
+            "https://localhost:9925/"
+        );
     }
 
     #[test]
@@ -663,27 +715,30 @@ mod tests {
     }
 
     #[test]
-    fn default_https_failure_explains_how_to_use_intentional_plain_http() {
+    fn bare_loopback_defaults_to_plain_http_and_reaches_operations_api() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            let _ = stream.write_all(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read])
+                .contains(r#"{"operation":"describe_all"}"#));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}",
+                )
+                .unwrap();
         });
         let mut connection = params("127.0.0.1", None, None);
         connection.port = Some(address.port());
         let client = Client::connect(connection).unwrap();
 
-        let error = client.describe_all().unwrap_err();
+        assert_eq!(
+            client.describe_all().unwrap()["data"],
+            serde_json::json!({})
+        );
         server.join().unwrap();
-
-        assert!(error.message.contains("used HTTPS"), "{}", error.message);
-        assert!(error.message.contains("SSL mode Disabled"));
-        assert!(error.message.contains("http://"));
     }
 
     #[test]
