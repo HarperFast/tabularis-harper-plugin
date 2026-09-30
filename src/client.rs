@@ -13,7 +13,7 @@ use crate::models::ConnectionParams;
 
 const DEFAULT_OPERATIONS_PORT: u16 = 9925;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(105);
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 static HTTP_CLIENT: OnceLock<Result<HttpClient, String>> = OnceLock::new();

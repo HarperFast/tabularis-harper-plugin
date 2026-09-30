@@ -12,6 +12,7 @@ use crate::rpc::result_response;
 
 const PRIMARY_KEY_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_PRIMARY_KEY_CACHE_ENTRIES: usize = 1_024;
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 thread_local! {
     static PRIMARY_KEY_CACHE: RefCell<HashMap<PrimaryKeyCacheKey, CachedPrimaryKey>> =
@@ -173,6 +174,14 @@ fn row_identity(params: &Value) -> Result<(String, Value), PluginError> {
     {
         return Err(PluginError::invalid_params(
             "Harper primary-key value must be a non-empty string or number; composite keys are not supported",
+        ));
+    }
+    if key
+        .as_f64()
+        .is_some_and(|number| number.abs() > MAX_SAFE_INTEGER)
+    {
+        return Err(PluginError::invalid_params(
+            "numeric Harper primary-key values must be within JavaScript's safe integer range; use a string key for larger values",
         ));
     }
     Ok((name.clone(), key.clone()))
@@ -344,6 +353,8 @@ mod tests {
         assert!(row_identity(&json!({ "pk_map": { "id": {} } })).is_err());
         assert!(row_identity(&json!({ "pk_map": { "id": [] } })).is_err());
         assert!(row_identity(&json!({ "pk_map": { "id": true } })).is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": 9007199254740991_u64 } })).is_ok());
+        assert!(row_identity(&json!({ "pk_map": { "id": 9007199254740992_u64 } })).is_err());
     }
 
     #[test]

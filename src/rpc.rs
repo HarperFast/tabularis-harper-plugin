@@ -5,9 +5,8 @@ use serde_json::{json, Value};
 use crate::error::PluginError;
 use crate::handlers;
 
-/// Parse one JSON-RPC line and return the response value (serialised
-/// downstream by `main.rs`). Never panics — parse errors and method
-/// failures are surfaced as JSON-RPC error responses.
+/// Parse one JSON-RPC line and return the response value serialized by the
+/// stdio loop. Parse errors and method failures become JSON-RPC errors.
 pub fn handle_line(line: &str) -> Value {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -93,11 +92,7 @@ pub fn result_response(id: Value, result: Result<Value, PluginError>) -> Value {
 }
 
 pub fn not_implemented(id: Value, method: &str) -> Value {
-    error_response(
-        id,
-        -32601,
-        &format!("method '{method}' is not implemented by this plugin yet"),
-    )
+    error_response(id, -32601, &format!("Method not found: {method}"))
 }
 
 #[cfg(test)]
@@ -120,5 +115,16 @@ mod tests {
         assert_eq!(response["error"]["code"], -32602);
         assert_eq!(response["error"]["message"], "bad host");
         assert_eq!(response["id"], 7);
+    }
+
+    #[test]
+    fn unsupported_methods_use_the_host_fallback_wording() {
+        let response = handle_line(r#"{"jsonrpc":"2.0","method":"execute_query_batch","id":9}"#);
+
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Method not found"));
     }
 }

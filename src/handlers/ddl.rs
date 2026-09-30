@@ -95,7 +95,18 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
                     "ALTER TABLE must qualify the Harper database when multiple databases are selected",
                 )
             })?;
-            client(params)?.drop_attribute(&database, &table, &attribute)?;
+            let client = client(params)?;
+            let description = client.describe_table(&database, &table)?;
+            if description
+                .get("schema_defined")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Err(PluginError::invalid_params(
+                    "Harper retains stored values when an attribute is dropped from a schema-defined table; refusing the operation because it would not erase the column data",
+                ));
+            }
+            client.drop_attribute(&database, &table, &attribute)?;
             invalidate_primary_key_cache(params, &database, &table);
             Ok(empty_result())
         }));
@@ -255,8 +266,8 @@ fn execute_command(params: &Value, command: &Value) -> Result<Value, PluginError
             let attributes = command
                 .get("attributes")
                 .and_then(Value::as_array)
-                .cloned()
                 .ok_or_else(|| PluginError::invalid_params("attributes must be an array"))?;
+            let attributes = sanitize_generated_attributes(attributes, primary_key)?;
             client.create_table(database, table, primary_key, attributes)?;
             invalidate_primary_key_cache(params, database, table);
         }
@@ -272,6 +283,70 @@ fn execute_command(params: &Value, command: &Value) -> Result<Value, PluginError
         }
     }
     Ok(empty_result())
+}
+
+fn sanitize_generated_attributes(
+    attributes: &[Value],
+    primary_key: &str,
+) -> Result<Vec<Value>, PluginError> {
+    let mut sanitized = Vec::with_capacity(attributes.len());
+    let mut primary_key_seen = false;
+    for attribute in attributes {
+        let name = required_string(attribute, "name")?;
+        let nullable = attribute
+            .get("nullable")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| PluginError::invalid_params("attribute nullable must be a boolean"))?;
+        let is_primary = attribute
+            .get("is_primary_key")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_primary {
+            if name != primary_key || primary_key_seen {
+                return Err(PluginError::invalid_params(
+                    "generated Harper DDL has inconsistent primary-key attributes",
+                ));
+            }
+            primary_key_seen = true;
+        }
+        let native_type = attribute.get("type").and_then(Value::as_str);
+        if native_type.is_some_and(|native_type| {
+            !matches!(
+                native_type,
+                "Int"
+                    | "Long"
+                    | "Float"
+                    | "BigInt"
+                    | "String"
+                    | "Boolean"
+                    | "Date"
+                    | "Bytes"
+                    | "Blob"
+            )
+        }) {
+            return Err(PluginError::invalid_params(
+                "generated Harper DDL contains an unsupported attribute type",
+            ));
+        }
+        let mut clean = json!({
+            "name": name,
+            "indexed": true,
+            "nullable": nullable,
+        });
+        if let Some(native_type) = native_type {
+            clean["type"] = Value::String(native_type.to_string());
+        }
+        if is_primary {
+            clean["is_primary_key"] = Value::Bool(true);
+        }
+        sanitized.push(clean);
+    }
+    if !primary_key_seen {
+        return Err(PluginError::invalid_params(
+            "generated Harper DDL is missing its primary-key attribute",
+        ));
+    }
+    Ok(sanitized)
 }
 
 fn harper_type(data_type: &str) -> Result<Option<&'static str>, PluginError> {
@@ -639,7 +714,7 @@ mod tests {
 
     use super::{
         add_column_sql, create_table_sql, decode_command, execute_ddl, parse_drop_column,
-        parse_drop_table,
+        parse_drop_table, sanitize_generated_attributes,
     };
 
     #[test]
@@ -707,6 +782,23 @@ mod tests {
         }));
 
         assert!(result.unwrap_err().message.contains("typographic quote"));
+    }
+
+    #[test]
+    fn generated_attributes_are_rebuilt_from_allowed_fields() {
+        let attributes = vec![json!({
+            "name": "id",
+            "type": "Int",
+            "nullable": false,
+            "indexed": false,
+            "is_primary_key": true,
+            "hidden_option": "ignored"
+        })];
+
+        let sanitized = sanitize_generated_attributes(&attributes, "id").unwrap();
+
+        assert_eq!(sanitized[0]["indexed"], true);
+        assert!(sanitized[0].get("hidden_option").is_none());
     }
 
     #[test]

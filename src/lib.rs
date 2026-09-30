@@ -1,4 +1,5 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde_json::Value;
 
@@ -9,10 +10,17 @@ mod models;
 mod rpc;
 
 pub fn handle_line(line: &str) -> Value {
-    rpc::handle_line(line)
+    catch_unwind(AssertUnwindSafe(|| rpc::handle_line(line))).unwrap_or_else(|_| {
+        let id = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|request| request.get("id").cloned())
+            .unwrap_or(Value::Null);
+        rpc::error_response(id, -32603, "internal plugin error")
+    })
 }
 
-pub fn run(reader: impl BufRead, mut writer: impl Write) -> io::Result<()> {
+pub fn run(reader: impl BufRead, writer: impl Write) -> io::Result<()> {
+    let mut writer = BufWriter::with_capacity(64 * 1024, writer);
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -390,6 +398,58 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("invalid database description"));
+    }
+
+    #[test]
+    fn drop_column_rejects_schema_defined_tables_that_would_retain_data() {
+        let (host, _requests, server) = server_responses(vec![
+            r#"{"schema_defined":true,"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"secret","type":"String"}]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": "ALTER TABLE `data`.`person` DROP COLUMN `secret`"
+                },
+                "id": 26
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retain"));
+    }
+
+    #[test]
+    fn drop_column_executes_for_dynamic_tables() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"schema_defined":false,"primary_key":"id","attributes":[{"attribute":"id"},{"attribute":"nickname"}]}"#,
+            r#"{"message":"attribute dropped"}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": "ALTER TABLE `data`.`person` DROP COLUMN `nickname`"
+                },
+                "id": 27
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"]["affected_rows"], 0, "{response}");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""operation":"drop_attribute""#));
     }
 
     #[test]

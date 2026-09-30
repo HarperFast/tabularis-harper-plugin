@@ -279,7 +279,11 @@ fn table_list(value: Value) -> Result<Value, PluginError> {
             json!({
                 "name": name,
                 "schema": null,
-                "comment": description.get("description").cloned().unwrap_or(Value::Null),
+                "comment": description
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -492,12 +496,13 @@ mod tests {
     fn reads_top_level_table_maps_even_when_a_table_is_named_tables() {
         let result = table_list(json!({
             "tables": { "description": "A real table" },
-            "owner": {}
+            "owner": { "description": { "source": "generated" } }
         }))
         .unwrap();
         assert_eq!(result[0]["name"], "tables");
         assert_eq!(result[0]["comment"], "A real table");
         assert_eq!(result[1]["name"], "owner");
+        assert_eq!(result[1]["comment"], json!(null));
     }
 
     #[test]

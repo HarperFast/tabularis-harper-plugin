@@ -70,13 +70,15 @@ The REPL also accepts a complete JSON-RPC request on one line. It calls the same
 
 Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results. Individual pages and Tabularis's **All** mode are limited to 10,000 rows; **All** sets `truncated: true` when more rows exist. The transport also enforces a 16 MiB response ceiling.
 
+SQL `INSERT`, `UPDATE`, and `DELETE` targets must be qualified as `database.table`. This prevents Harper from resolving an unqualified write against a different database than the active Tabularis context.
+
 Harper documents may have different fields in every row. The plugin discovers all fields on the visible page, but bounds the resulting rectangular grid to 1,000 columns and 1,000,000 empty padding cells. Paged queries return a precise error when that shape is too sparse; **All** mode returns the largest complete prefix and marks it truncated.
 
 ## Harper-specific behavior
 
 - Table creation uses Harper's schema-defined attributes. Declared types and nullability are enforced by current Harper versions, and inserts do not create undeclared attributes automatically.
 - `VARCHAR` input maps to Harper's `String` type and is previewed as `TEXT`; Harper does not enforce a character-length limit for it.
-- Dropping an attribute from a schema-defined table removes it from the schema but current Harper does not purge that property from already stored records. Re-adding the attribute can expose those stored values again; do not use attribute drop as a data-erasure workflow.
+- Dropping an attribute is rejected for schema-defined tables because current Harper would retain the stored property values. Dynamic-table attribute drops remain available when Harper can purge the data.
 - Adding a column supports `ANY` only. Harper's `create_attribute` operation has no type/nullability/default input, so the plugin rejects typed additions rather than reporting a type it did not enforce.
 - Harper manages per-attribute indexes. They are shown accurately, but the Operations API does not support creating/dropping user-named, unique, or compound indexes.
 - Foreign keys, views, routines, and SQL EXPLAIN are not advertised because Harper does not expose matching enforced semantics through this driver.

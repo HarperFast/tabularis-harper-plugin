@@ -61,6 +61,9 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .max(1);
     let page_size = requested_page_size(params);
     let is_select = kind == "SELECT";
+    if !is_select {
+        require_qualified_write_target(&query, kind)?;
+    }
     let has_paging_clause = ["limit", "offset", "fetch", "top"]
         .into_iter()
         .any(|keyword| contains_top_level_keyword(&query, keyword));
@@ -116,6 +119,89 @@ fn statement_kind(query: &str) -> Option<&'static str> {
     ["SELECT", "INSERT", "UPDATE", "DELETE"]
         .into_iter()
         .find(|kind| first.eq_ignore_ascii_case(kind))
+}
+
+fn require_qualified_write_target(query: &str, kind: &str) -> Result<(), PluginError> {
+    let mut rest = strip_leading_comments(query)?;
+    rest = strip_sql_keyword(rest, kind)
+        .ok_or_else(|| PluginError::invalid_params("could not locate the SQL write target"))?;
+    if kind == "INSERT" {
+        rest = strip_sql_keyword(rest, "INTO").ok_or_else(|| {
+            PluginError::invalid_params("INSERT must include INTO followed by database.table")
+        })?;
+    } else if kind == "DELETE" {
+        rest = strip_sql_keyword(rest, "FROM").ok_or_else(|| {
+            PluginError::invalid_params("DELETE must include FROM followed by database.table")
+        })?;
+    }
+    let rest = consume_sql_identifier(rest)
+        .ok_or_else(|| PluginError::invalid_params("SQL write target must be database.table"))?;
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix('.') else {
+        return Err(PluginError::invalid_params(
+            "SQL INSERT, UPDATE, and DELETE targets must be qualified as database.table",
+        ));
+    };
+    if consume_sql_identifier(rest).is_none() {
+        return Err(PluginError::invalid_params(
+            "SQL write target must include a table after the database name",
+        ));
+    }
+    Ok(())
+}
+
+fn strip_leading_comments(mut query: &str) -> Result<&str, PluginError> {
+    loop {
+        query = query.trim_start();
+        if let Some(comment) = query.strip_prefix("--") {
+            query = comment
+                .split_once('\n')
+                .map_or("", |(_, remainder)| remainder);
+            continue;
+        }
+        if let Some(comment) = query.strip_prefix("/*") {
+            let (_, remainder) = comment.split_once("*/").ok_or_else(|| {
+                PluginError::invalid_params("SQL contains an unterminated comment")
+            })?;
+            query = remainder;
+            continue;
+        }
+        return Ok(query);
+    }
+}
+
+fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let input = input.trim_start();
+    let prefix = input.get(..keyword.len())?;
+    if !prefix.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &input[keyword.len()..];
+    (rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('`'))
+        .then_some(rest)
+}
+
+fn consume_sql_identifier(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    if let Some(mut rest) = input.strip_prefix('`') {
+        loop {
+            let index = rest.find('`')?;
+            rest = &rest[index + 1..];
+            if let Some(escaped) = rest.strip_prefix('`') {
+                rest = escaped;
+            } else {
+                return Some(rest);
+            }
+        }
+    }
+    let end = input
+        .char_indices()
+        .take_while(|(_, character)| {
+            character.is_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?;
+    Some(&input[end..])
 }
 
 fn normalized_statement(query: &str) -> Result<String, PluginError> {
@@ -530,8 +616,9 @@ mod tests {
 
     use super::{
         bounded_shape, contains_top_level_keyword, normalized_statement, requested_page_size,
-        statement_kind, tabularis_query_result, unbounded_query_result, write_query_result,
-        MAX_PADDING_CELLS, MAX_RESULT_COLUMNS, MAX_UNBOUNDED_ROWS,
+        require_qualified_write_target, statement_kind, tabularis_query_result,
+        unbounded_query_result, write_query_result, MAX_PADDING_CELLS, MAX_RESULT_COLUMNS,
+        MAX_UNBOUNDED_ROWS,
     };
 
     #[test]
@@ -575,6 +662,30 @@ mod tests {
             Some("SELECT")
         );
         assert_eq!(statement_kind("CREATE TABLE dog (id INT)"), None);
+    }
+
+    #[test]
+    fn sql_writes_require_database_qualified_targets() {
+        for (query, kind) in [
+            ("INSERT INTO data.dog (id) VALUES (1)", "INSERT"),
+            ("UPDATE `data`.`dog` SET name = 'Rover'", "UPDATE"),
+            ("-- scoped\nDELETE FROM data.dog WHERE id = 1", "DELETE"),
+        ] {
+            assert!(
+                require_qualified_write_target(query, kind).is_ok(),
+                "{query}"
+            );
+        }
+        for (query, kind) in [
+            ("INSERT INTO dog (id) VALUES (1)", "INSERT"),
+            ("UPDATE dog SET name = 'Rover'", "UPDATE"),
+            ("DELETE FROM dog WHERE id = 1", "DELETE"),
+        ] {
+            assert!(
+                require_qualified_write_target(query, kind).is_err(),
+                "{query}"
+            );
+        }
     }
 
     #[test]
