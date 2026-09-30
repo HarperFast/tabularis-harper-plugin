@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use serde_json::{json, Value};
@@ -59,6 +60,12 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
     if let Some(command) = decode_command(query) {
         return Some(command.and_then(|command| execute_command(params, &command)));
     }
+    let query = match ddl_dispatch_query(query) {
+        Ok(Some(query)) => query,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let query = query.as_ref();
     if starts_with_keyword(query, "DROP TABLE") {
         return Some(parse_drop_table(query).and_then(|(parsed_database, table, if_exists)| {
             let database = parsed_database.or_else(|| database(params).ok());
@@ -116,6 +123,77 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
         }));
     }
     None
+}
+
+fn ddl_dispatch_query(query: &str) -> Result<Option<Cow<'_, str>>, PluginError> {
+    if starts_with_keyword(query, "DROP TABLE") || starts_with_keyword(query, "ALTER TABLE") {
+        return Ok(Some(Cow::Borrowed(query)));
+    }
+    let first_code = strip_leading_ddl_comments(query)?;
+    if first_code.starts_with(COMMAND_PREFIX) {
+        return Err(PluginError::invalid_params(
+            "generated Harper DDL commands must not be preceded by comments",
+        ));
+    }
+    if !starts_with_ddl_prefix(first_code, "DROP") && !starts_with_ddl_prefix(first_code, "ALTER") {
+        return Ok(None);
+    }
+    let uncommented = without_sql_comments(query)?;
+    if starts_with_keyword(&uncommented, "DROP TABLE")
+        || starts_with_keyword(&uncommented, "ALTER TABLE")
+    {
+        Ok(Some(Cow::Owned(uncommented)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn starts_with_ddl_prefix(input: &str, keyword: &str) -> bool {
+    let input = input.trim_start();
+    let Some(prefix) = input.get(..keyword.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    let rest = &input[keyword.len()..];
+    rest.is_empty()
+        || rest.starts_with(char::is_whitespace)
+        || rest.starts_with('`')
+        || rest.starts_with("/*")
+        || starts_line_comment(rest)
+}
+
+fn strip_leading_ddl_comments(mut input: &str) -> Result<&str, PluginError> {
+    loop {
+        input = input.trim_start();
+        if input.starts_with(COMMAND_PREFIX) {
+            return Ok(input);
+        }
+        if let Some(comment) = input.strip_prefix("/*") {
+            let (_, remainder) = comment.split_once("*/").ok_or_else(|| {
+                PluginError::invalid_params("schema change contains an unterminated comment")
+            })?;
+            input = remainder;
+            continue;
+        }
+        if starts_line_comment(input) {
+            let comment = input
+                .strip_prefix("--")
+                .expect("line comment prefix was checked");
+            input = comment
+                .split_once('\n')
+                .map_or("", |(_, remainder)| remainder);
+            continue;
+        }
+        return Ok(input);
+    }
+}
+
+fn starts_line_comment(input: &str) -> bool {
+    input
+        .strip_prefix("--")
+        .is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
 }
 
 fn create_table_sql(params: &Value) -> Result<String, PluginError> {
@@ -616,14 +694,23 @@ fn starts_with_keyword(query: &str, keyword: &str) -> bool {
 }
 
 fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
-    let input = input.trim_start();
-    let prefix = input.get(..keyword.len())?;
-    if !prefix.eq_ignore_ascii_case(keyword) {
-        return None;
+    let mut input = input.trim_start();
+    for (index, word) in keyword.split_whitespace().enumerate() {
+        if index > 0 {
+            let trimmed = input.trim_start();
+            if trimmed.len() == input.len() {
+                return None;
+            }
+            input = trimmed;
+        }
+        let prefix = input.get(..word.len())?;
+        if !prefix.eq_ignore_ascii_case(word) {
+            return None;
+        }
+        input = &input[word.len()..];
     }
-    let rest = &input[keyword.len()..];
-    (rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('`'))
-        .then_some(rest)
+    (input.is_empty() || input.starts_with(char::is_whitespace) || input.starts_with('`'))
+        .then_some(input)
 }
 
 fn ensure_empty(rest: &str) -> Result<(), PluginError> {
@@ -919,6 +1006,19 @@ mod tests {
                 false
             )
         );
+        assert_eq!(
+            parse_drop_table("DROP /* routing */ TABLE `data`.`person`").unwrap(),
+            (Some("data".to_string()), "person".to_string(), false)
+        );
+        assert_eq!(
+            parse_drop_column("ALTER/**/TABLE `data`.`person` DROP /* cleanup */ COLUMN `age`")
+                .unwrap(),
+            (
+                Some("data".to_string()),
+                "person".to_string(),
+                "age".to_string()
+            )
+        );
     }
 
     #[test]
@@ -951,5 +1051,64 @@ mod tests {
         )
         .unwrap();
         assert!(result.unwrap_err().message.contains("must qualify"));
+    }
+
+    #[test]
+    fn leading_comments_still_dispatch_destructive_ddl() {
+        let result = execute_ddl(
+            &json!({
+                "params": {
+                    "host": "http://127.0.0.1:1",
+                    "database": ["data", "staging"]
+                }
+            }),
+            "/* maintenance */ DROP TABLE `person`",
+        )
+        .expect("DROP TABLE should be recognized after a leading comment");
+
+        assert!(result.unwrap_err().message.contains("must qualify"));
+    }
+
+    #[test]
+    fn ddl_dispatch_ignores_keywords_inside_comments() {
+        let params = json!({ "params": { "host": "http://127.0.0.1:1" } });
+
+        assert!(execute_ddl(
+            &params,
+            "/* DROP TABLE data.person */ SELECT * FROM data.person"
+        )
+        .is_none());
+        assert!(execute_ddl(&params, "-- DROP TABLE data.person\nSELECT 1").is_none());
+    }
+
+    #[test]
+    fn ddl_dispatch_rejects_unterminated_leading_comments() {
+        let result = execute_ddl(
+            &json!({ "params": { "host": "http://127.0.0.1:1" } }),
+            "/* maintenance DROP TABLE data.person",
+        )
+        .expect("unterminated leading comments should return an error");
+
+        assert!(result.unwrap_err().message.contains("unterminated comment"));
+    }
+
+    #[test]
+    fn comments_cannot_be_prepended_to_generated_commands() {
+        let generated = create_table_sql(&json!({
+            "params": { "database": "data" },
+            "table_name": "person",
+            "columns": [
+                { "name": "id", "data_type": "INTEGER", "is_pk": true, "is_nullable": false, "is_auto_increment": false, "default_value": null }
+            ]
+        }))
+        .unwrap();
+        let query = format!("/* user prefix */ {generated}");
+        let result = execute_ddl(
+            &json!({ "params": { "host": "http://127.0.0.1:1" } }),
+            &query,
+        )
+        .expect("a prefixed generated command should be rejected");
+
+        assert!(result.unwrap_err().message.contains("must not be preceded"));
     }
 }

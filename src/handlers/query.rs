@@ -159,7 +159,10 @@ fn strip_leading_comments(query: &str) -> Result<&str, PluginError> {
 fn skip_sql_separators(mut input: &str) -> Option<&str> {
     loop {
         input = input.trim_start();
-        if let Some(comment) = input.strip_prefix("--") {
+        if starts_line_comment(input) {
+            let comment = input
+                .strip_prefix("--")
+                .expect("line comment prefix was checked");
             input = comment
                 .split_once('\n')
                 .map_or("", |(_, remainder)| remainder);
@@ -174,6 +177,12 @@ fn skip_sql_separators(mut input: &str) -> Option<&str> {
     }
 }
 
+fn starts_line_comment(input: &str) -> bool {
+    input
+        .strip_prefix("--")
+        .is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
+}
+
 fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     let input = skip_sql_separators(input)?;
     let prefix = input.get(..keyword.len())?;
@@ -181,8 +190,12 @@ fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
         return None;
     }
     let rest = &input[keyword.len()..];
-    (rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('`'))
-        .then_some(rest)
+    (rest.is_empty()
+        || rest.starts_with(char::is_whitespace)
+        || rest.starts_with('`')
+        || rest.starts_with("/*")
+        || starts_line_comment(rest))
+    .then_some(rest)
 }
 
 fn consume_sql_identifier(input: &str) -> Option<&str> {
@@ -677,8 +690,11 @@ mod tests {
         for (query, kind) in [
             ("INSERT INTO data.dog (id) VALUES (1)", "INSERT"),
             ("INSERT /* hint */ INTO data.dog (id) VALUES (1)", "INSERT"),
+            ("INSERT/* hint */INTO/**/data.dog (id) VALUES (1)", "INSERT"),
             ("UPDATE `data`.`dog` SET name = 'Rover'", "UPDATE"),
+            ("UPDATE/* audit */data.dog SET name = 'Rover'", "UPDATE"),
             ("-- scoped\nDELETE FROM data.dog WHERE id = 1", "DELETE"),
+            ("DELETE/**/FROM/**/data.dog WHERE id = 1", "DELETE"),
         ] {
             assert!(
                 require_qualified_write_target(query, kind).is_ok(),

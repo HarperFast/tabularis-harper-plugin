@@ -1,22 +1,24 @@
 use std::error::Error as StdError;
-use std::io::Read;
+use std::fmt;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use reqwest::blocking::{Client as HttpClient, RequestBuilder, Response};
 use reqwest::redirect::Policy;
-use reqwest::{StatusCode, Url};
+use reqwest::{Client as HttpClient, RequestBuilder, Response, StatusCode, Url};
 use serde_json::{json, Value};
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::error::PluginError;
 use crate::models::ConnectionParams;
 
 const DEFAULT_OPERATIONS_PORT: u16 = 9925;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(105);
+const MIN_MUTATION_BUDGET: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 static HTTP_CLIENT: OnceLock<Result<HttpClient, String>> = OnceLock::new();
+static HTTP_RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 
 pub struct Client {
     endpoint: Url,
@@ -24,10 +26,18 @@ pub struct Client {
     username: Option<String>,
     password: Option<String>,
     http: HttpClient,
+    deadline: Instant,
 }
 
 impl Client {
     pub fn connect(params: ConnectionParams) -> Result<Self, PluginError> {
+        Self::connect_with_timeout(params, REQUEST_TIMEOUT)
+    }
+
+    fn connect_with_timeout(
+        params: ConnectionParams,
+        timeout: Duration,
+    ) -> Result<Self, PluginError> {
         let https_inferred = inferred_https(&params);
         let endpoint = build_endpoint(&params)?;
         let username = params.username.filter(|username| !username.is_empty());
@@ -46,6 +56,9 @@ impl Client {
             }
             _ => {}
         }
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            PluginError::internal("Harper request timeout exceeds the supported duration")
+        })?;
 
         Ok(Self {
             endpoint,
@@ -53,6 +66,7 @@ impl Client {
             username,
             password,
             http: shared_http_client()?,
+            deadline,
         })
     }
 
@@ -60,15 +74,8 @@ impl Client {
         let url = self.endpoint.join("health").map_err(|error| {
             PluginError::invalid_params(format!("invalid Harper health URL: {error}"))
         })?;
-        let mut response = self
-            .http
-            .get(url)
-            .send()
-            .map_err(|error| self.transport_error("Harper health check failed", &error))?;
-        let status = response.status();
-        let body = read_body(&mut response).map_err(|error| {
-            PluginError::connection(format!("failed to read Harper response: {error}"))
-        })?;
+        let (status, body) =
+            self.exchange(self.http.get(url), "Harper health check failed", None)?;
 
         if status.is_success() {
             Ok(())
@@ -231,22 +238,7 @@ impl Client {
         mutation_name: Option<&str>,
     ) -> Result<Value, PluginError> {
         let request = self.authorize(self.http.post(self.endpoint.clone()).json(&operation));
-        let mut response = request.send().map_err(|error| {
-            if let Some(name) = mutation_name.filter(|_| !error.is_connect()) {
-                unknown_mutation_outcome(name, &error_detail(&error))
-            } else {
-                self.transport_error("Harper request failed", &error)
-            }
-        })?;
-        let status = response.status();
-        let body = read_body(&mut response).map_err(|error| {
-            if status.is_success() {
-                if let Some(name) = mutation_name {
-                    return unknown_mutation_outcome(name, &error.to_string());
-                }
-            }
-            PluginError::connection(format!("failed to read Harper response: {error}"))
-        })?;
+        let (status, body) = self.exchange(request, "Harper request failed", mutation_name)?;
 
         if !status.is_success() {
             return Err(http_error(status, &body));
@@ -268,6 +260,68 @@ impl Client {
                 PluginError::connection(format!("Harper returned invalid JSON: {error}"))
             }
         })
+    }
+
+    fn exchange(
+        &self,
+        request: RequestBuilder,
+        context: &str,
+        mutation_name: Option<&str>,
+    ) -> Result<(StatusCode, Vec<u8>), PluginError> {
+        let remaining = self.remaining_budget(mutation_name)?;
+        let request = request.timeout(remaining);
+        let exchange = async move {
+            let mut response = request.send().await.map_err(ExchangeError::Send)?;
+            let status = response.status();
+            let body = read_body(&mut response)
+                .await
+                .map_err(|error| ExchangeError::Body { status, error })?;
+            Ok((status, body))
+        };
+        match http_runtime()?.block_on(async { tokio::time::timeout(remaining, exchange).await }) {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(ExchangeError::Send(error))) => {
+                if let Some(name) = mutation_name.filter(|_| !error.is_connect()) {
+                    Err(unknown_mutation_outcome(name, &error_detail(&error)))
+                } else {
+                    Err(self.transport_error(context, &error))
+                }
+            }
+            Ok(Err(ExchangeError::Body { status, error })) => {
+                if status.is_success() {
+                    if let Some(name) = mutation_name {
+                        return Err(unknown_mutation_outcome(name, &error.to_string()));
+                    }
+                }
+                Err(PluginError::connection(format!(
+                    "failed to read Harper response: {error}"
+                )))
+            }
+            Err(_) => match mutation_name {
+                Some(name) => Err(unknown_mutation_outcome(
+                    name,
+                    "the JSON-RPC request deadline elapsed",
+                )),
+                None => Err(PluginError::connection(format!(
+                    "{context}: the JSON-RPC request deadline elapsed"
+                ))),
+            },
+        }
+    }
+
+    fn remaining_budget(&self, mutation_name: Option<&str>) -> Result<Duration, PluginError> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| PluginError::connection("Harper JSON-RPC request deadline elapsed"))?;
+        if let Some(name) = mutation_name.filter(|_| remaining < MIN_MUTATION_BUDGET) {
+            return Err(PluginError::connection(format!(
+                "Harper {name} was not sent because less than {} seconds remained in the JSON-RPC request budget",
+                MIN_MUTATION_BUDGET.as_secs()
+            )));
+        }
+        Ok(remaining)
     }
 
     fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
@@ -341,6 +395,20 @@ fn shared_http_client() -> Result<HttpClient, PluginError> {
         .cloned()
         .map_err(|error| {
             PluginError::internal(format!("failed to initialize HTTP client: {error}"))
+        })
+}
+
+fn http_runtime() -> Result<&'static Runtime, PluginError> {
+    HTTP_RUNTIME
+        .get_or_init(|| {
+            RuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| {
+            PluginError::internal(format!("failed to initialize HTTP runtime: {error}"))
         })
 }
 
@@ -458,18 +526,41 @@ fn reject_unsupported_tls_files(params: &ConnectionParams) -> Result<(), PluginE
     Ok(())
 }
 
-fn read_body(response: &mut Response) -> std::io::Result<Vec<u8>> {
+async fn read_body(response: &mut Response) -> Result<Vec<u8>, BodyReadError> {
     let mut body = Vec::new();
-    response
-        .take(MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut body)?;
-    if body.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(std::io::Error::other(format!(
-            "Harper response exceeded the {} MiB safety limit",
-            MAX_RESPONSE_BYTES / 1024 / 1024
-        )));
+    while let Some(chunk) = response.chunk().await.map_err(BodyReadError::Transport)? {
+        if body.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(BodyReadError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+enum ExchangeError {
+    Send(reqwest::Error),
+    Body {
+        status: StatusCode,
+        error: BodyReadError,
+    },
+}
+
+enum BodyReadError {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+impl fmt::Display for BodyReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::TooLarge => write!(
+                formatter,
+                "Harper response exceeded the {} MiB safety limit",
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ),
+        }
+    }
 }
 
 fn unknown_mutation_outcome(name: &str, detail: &str) -> PluginError {
@@ -519,9 +610,101 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::{build_endpoint, Client};
+    use super::{build_endpoint, Client, REQUEST_TIMEOUT};
     use crate::models::ConnectionParams;
+
+    #[test]
+    fn request_budget_exceeds_the_old_fifty_second_limit() {
+        assert!(REQUEST_TIMEOUT > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn one_request_can_use_most_of_the_rpc_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_millis(1_500));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}",
+                )
+                .unwrap();
+        });
+        let client = Client::connect_with_timeout(
+            params(&format!("http://{address}"), None, None),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.describe_all().unwrap()["data"],
+            serde_json::json!({})
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sequential_requests_share_one_deadline_including_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = first.read(&mut request).unwrap();
+            thread::sleep(Duration::from_millis(1_200));
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}",
+                )
+                .unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut request).unwrap();
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"update_hashes\":[1]",
+                )
+                .unwrap();
+            thread::sleep(Duration::from_secs(5));
+        });
+        let started = Instant::now();
+        let client = Client::connect_with_timeout(
+            params(&format!("http://{address}"), None, None),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        client.describe_all().unwrap();
+        let error = client
+            .update("data", "person", serde_json::json!({ "id": 1 }))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(error.message.contains("outcome is unknown"));
+        assert!(elapsed < Duration::from_millis(5_750), "{elapsed:?}");
+    }
+
+    #[test]
+    fn mutation_is_not_sent_without_a_minimum_remaining_budget() {
+        let client = Client::connect_with_timeout(
+            params("http://127.0.0.1:1", None, None),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let error = client
+            .insert("data", "person", serde_json::json!({ "id": 1 }))
+            .unwrap_err();
+
+        assert!(error.message.contains("was not sent"));
+        assert!(!error.message.contains("outcome is unknown"));
+    }
 
     #[test]
     fn operation_sends_basic_auth_and_json() {

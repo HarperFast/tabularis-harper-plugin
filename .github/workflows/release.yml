@@ -91,6 +91,7 @@ jobs:
           mkdir -p "$STAGE"
           cp target/${{ matrix.target }}/release/harper-plugin${{ matrix.binary-suffix }} "$STAGE/"
           cp .tabularium "$STAGE/"
+          cp LICENSE "$STAGE/"
           if [ -d assets ]; then
             cp -r assets "$STAGE/"
           fi
@@ -108,6 +109,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\harper-plugin${{ matrix.binary-suffix }}" $stage
           Copy-Item ".tabularium" $stage
+          Copy-Item "LICENSE" $stage
           if (Test-Path "assets") {
             Copy-Item -Recurse "assets" "$stage\assets"
           }
