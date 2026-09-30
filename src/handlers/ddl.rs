@@ -146,7 +146,7 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
         }
         attributes.push(attribute);
 
-        let mut preview = format!("{} {}", quote_identifier(name), data_type);
+        let mut preview = format!("{} {}", quote_identifier(name), preview_type(native_type));
         if !nullable {
             preview.push_str(" NOT NULL");
         }
@@ -269,6 +269,22 @@ fn harper_type(data_type: &str) -> Result<Option<&'static str>, PluginError> {
     }
 }
 
+fn preview_type(native_type: Option<&str>) -> &'static str {
+    match native_type {
+        None => "ANY",
+        Some("Int") => "INTEGER",
+        Some("Long") => "LONG",
+        Some("Float") => "FLOAT",
+        Some("BigInt") => "BIGINT",
+        Some("String") => "TEXT",
+        Some("Boolean") => "BOOLEAN",
+        Some("Date") => "DATE",
+        Some("Bytes") => "BYTES",
+        Some("Blob") => "BLOB",
+        Some(_) => "ANY",
+    }
+}
+
 fn unambiguous_database(params: &Value) -> Result<String, PluginError> {
     if let Some(database) = params.get("schema").and_then(non_empty_string) {
         return Ok(database.to_string());
@@ -351,8 +367,10 @@ fn parse_identifier(input: &str) -> Result<(String, &str), PluginError> {
     }
     let end = input
         .char_indices()
-        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-        .map(|(index, ch)| index + ch.len_utf8())
+        .take_while(|(_, character)| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .map(|(index, character)| index + character.len_utf8())
         .last()
         .unwrap_or(0);
     if end == 0 {
@@ -414,6 +432,8 @@ fn quote_table(database: &str, table: &str) -> String {
 }
 
 fn encode_command(command: &Value, preview: &str) -> String {
+    let mut command = command.clone();
+    command["preview"] = Value::String(preview.to_string());
     let encoded = command
         .to_string()
         .as_bytes()
@@ -425,10 +445,9 @@ fn encode_command(command: &Value, preview: &str) -> String {
 
 fn decode_command(query: &str) -> Option<Result<Value, PluginError>> {
     let query = query.trim_start();
-    let encoded = query
+    let (encoded, visible_preview) = query
         .strip_prefix(COMMAND_PREFIX)?
-        .split_once(COMMAND_SUFFIX)?
-        .0;
+        .split_once(COMMAND_SUFFIX)?;
     Some((|| {
         if encoded.len() % 2 != 0 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(PluginError::invalid_params(
@@ -445,10 +464,26 @@ fn decode_command(query: &str) -> Option<Result<Value, PluginError>> {
                 u8::from_str_radix(pair, 16).expect("hex pair was validated")
             })
             .collect::<Vec<_>>();
-        serde_json::from_slice(&bytes).map_err(|_| {
+        let command: Value = serde_json::from_slice(&bytes).map_err(|_| {
             PluginError::invalid_params("invalid generated Harper DDL command payload")
-        })
+        })?;
+        let expected_preview = command
+            .get("preview")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PluginError::invalid_params("generated Harper DDL command has no SQL preview")
+            })?;
+        if normalize_preview(visible_preview) != normalize_preview(expected_preview) {
+            return Err(PluginError::invalid_params(
+                "the generated Harper DDL preview was edited; regenerate the schema change before executing it",
+            ));
+        }
+        Ok(command)
     })())
+}
+
+fn normalize_preview(preview: &str) -> String {
+    preview.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn client(params: &Value) -> Result<Client, PluginError> {
@@ -490,10 +525,29 @@ mod tests {
         let command = decode_command(&sql).unwrap().unwrap();
 
         assert!(sql.contains("`odd``table`"));
-        assert!(sql.contains("`display``name` VARCHAR(255)"));
+        assert!(sql.contains("`display``name` TEXT"));
         assert_eq!(command["primary_key"], "id");
         assert_eq!(command["attributes"][0]["type"], "Int");
         assert_eq!(command["attributes"][1]["type"], "String");
+    }
+
+    #[test]
+    fn generated_ddl_rejects_an_edited_visible_preview() {
+        let sql = create_table_sql(&json!({
+            "params": { "database": "data" },
+            "table_name": "person",
+            "columns": [
+                { "name": "id", "data_type": "INTEGER", "is_pk": true, "is_nullable": false, "is_auto_increment": true, "default_value": null }
+            ]
+        }))
+        .unwrap();
+        let edited = sql.replacen("`person`", "`other`", 1);
+
+        assert!(decode_command(&edited)
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("was edited"));
     }
 
     #[test]

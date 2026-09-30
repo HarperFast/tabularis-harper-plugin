@@ -67,7 +67,7 @@ fn connection_from_env() -> Result<Value, String> {
         .map_err(|_| "HARPER_PORT must be an integer from 1 through 65535".to_string())?;
     Ok(json!({
         "driver": "harper",
-        "host": env::var("HARPER_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        "host": env::var("HARPER_HOST").unwrap_or_else(|_| "http://localhost".to_string()),
         "port": port,
         "database": env::var("HARPER_DATABASE").ok(),
         "username": env::var("HARPER_USERNAME").ok(),

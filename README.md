@@ -52,7 +52,7 @@ HTTP, authentication and Operations API details stay in `client.rs`. Handlers on
 ## Testing without Tabularis
 
 ```bash
-HARPER_HOST=localhost \
+HARPER_HOST=http://localhost \
 HARPER_PORT=9925 \
 HARPER_DATABASE=data \
 HARPER_USERNAME=HDB_ADMIN \
@@ -68,11 +68,12 @@ just repl
 
 The REPL also accepts a complete JSON-RPC request on one line. It calls the same production dispatch path as the shipped plugin; credentials are read from the environment and are not printed.
 
-Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results. Tabularis's **All** mode fetches at most 10,000 rows and sets `truncated: true` when more rows exist, preventing an oversized response from failing after a full scan.
+Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results. Individual pages and Tabularis's **All** mode are limited to 10,000 rows; **All** sets `truncated: true` when more rows exist. The transport also enforces a 16 MiB response ceiling.
 
 ## Harper-specific behavior
 
 - Table creation uses Harper's schema-defined attributes. Declared types and nullability are enforced by current Harper versions, and inserts do not create undeclared attributes automatically.
+- `VARCHAR` input maps to Harper's `String` type and is previewed as `TEXT`; Harper does not enforce a character-length limit for it.
 - Dropping an attribute from a schema-defined table removes it from the schema but current Harper does not purge that property from already stored records. Re-adding the attribute can expose those stored values again; do not use attribute drop as a data-erasure workflow.
 - Adding a column supports `ANY` only. Harper's `create_attribute` operation has no type/nullability/default input, so the plugin rejects typed additions rather than reporting a type it did not enforce.
 - Harper manages per-attribute indexes. They are shown accurately, but the Operations API does not support creating/dropping user-named, unique, or compound indexes.
@@ -81,7 +82,7 @@ Queries without their own top-level `LIMIT` are fetched from Harper one page at 
 
 ## TLS
 
-The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. Preferred/required/verification modes force HTTPS, and an explicit `http://` host is rejected for those modes. Custom CA, client certificate, and client key files are rejected until the plugin can apply them to its Rust TLS client; they are never silently ignored.
+The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. A bare host defaults to HTTPS; use an explicit `http://` URL or select Disabled only for an intentionally unencrypted connection. Preferred/required/verification modes force HTTPS, and an explicit `http://` host is rejected for those modes. Custom CA, client certificate, and client key files are rejected until the plugin can apply them to its Rust TLS client; they are never silently ignored, so self-signed HTTPS endpoints require a publicly trusted certificate for now.
 
 ## Publishing
 

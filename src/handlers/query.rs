@@ -10,7 +10,7 @@ use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{not_implemented, result_response};
 
 const MAX_UNBOUNDED_ROWS: u64 = 10_000;
-const MAX_PAGE_SIZE: u64 = 100_000;
+const MAX_PAGE_SIZE: u64 = MAX_UNBOUNDED_ROWS;
 
 pub fn test_connection(id: Value, params: &Value) -> Value {
     let result = client(params)
@@ -384,6 +384,15 @@ fn unbounded_query_result(response: Value, elapsed: u64, cap_enforced: bool) -> 
 }
 
 fn write_query_result(response: Value, elapsed: u64) -> Result<Value, PluginError> {
+    let skipped = response
+        .get("skipped_hashes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if skipped > 0 {
+        return Err(PluginError::connection(format!(
+            "Harper skipped {skipped} record(s) while executing the SQL mutation"
+        )));
+    }
     let affected_rows = [
         "inserted_hashes",
         "update_hashes",
@@ -397,7 +406,7 @@ fn write_query_result(response: Value, elapsed: u64) -> Result<Value, PluginErro
         response
             .get("affected_rows")
             .and_then(Value::as_u64)
-            .map(|v| v as usize)
+            .map(|affected_rows| affected_rows as usize)
     })
     .ok_or_else(|| {
         PluginError::connection(
@@ -474,6 +483,10 @@ mod tests {
         assert_eq!(requested_page_size(&json!({ "page_size": 50 })), Some(50));
         assert_eq!(requested_page_size(&json!({})), Some(100));
         assert_eq!(requested_page_size(&json!({ "limit": null })), None);
+        assert_eq!(
+            requested_page_size(&json!({ "limit": 50_000 })),
+            Some(10_000)
+        );
     }
 
     #[test]
@@ -615,6 +628,12 @@ mod tests {
                 .unwrap();
         assert_eq!(result["affected_rows"], 2);
         assert_eq!(result["rows"], json!([]));
+        assert!(
+            write_query_result(json!({ "update_hashes": [1], "skipped_hashes": [2] }), 4)
+                .unwrap_err()
+                .message
+                .contains("skipped 1")
+        );
         assert!(write_query_result(json!({ "message": "ok" }), 0).is_err());
     }
 }

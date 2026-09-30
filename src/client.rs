@@ -60,7 +60,9 @@ impl Client {
             PluginError::connection(format!("Harper health check failed: {error}"))
         })?;
         let status = response.status();
-        let body = read_body(&mut response)?;
+        let body = read_body(&mut response).map_err(|error| {
+            PluginError::connection(format!("failed to read Harper response: {error}"))
+        })?;
 
         if status.is_success() {
             Ok(())
@@ -100,7 +102,7 @@ impl Client {
     }
 
     pub fn sql_mutation(&self, sql: &str) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "SQL mutation",
             json!({
                 "operation": "sql",
@@ -110,7 +112,7 @@ impl Client {
     }
 
     pub fn insert(&self, database: &str, table: &str, record: Value) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "insert",
             json!({
                 "operation": "insert",
@@ -122,7 +124,7 @@ impl Client {
     }
 
     pub fn update(&self, database: &str, table: &str, record: Value) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "update",
             json!({
                 "operation": "update",
@@ -134,7 +136,7 @@ impl Client {
     }
 
     pub fn delete(&self, database: &str, table: &str, key: Value) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "delete",
             json!({
                 "operation": "delete",
@@ -152,7 +154,7 @@ impl Client {
         primary_key: &str,
         attributes: Vec<Value>,
     ) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "create_table",
             json!({
                 "operation": "create_table",
@@ -170,7 +172,7 @@ impl Client {
         table: &str,
         attribute: &str,
     ) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "create_attribute",
             json!({
                 "operation": "create_attribute",
@@ -182,7 +184,7 @@ impl Client {
     }
 
     pub fn drop_table(&self, database: &str, table: &str) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "drop_table",
             json!({
                 "operation": "drop_table",
@@ -198,7 +200,7 @@ impl Client {
         table: &str,
         attribute: &str,
     ) -> Result<Value, PluginError> {
-        self.mutation(
+        self.mutation_operation(
             "drop_attribute",
             json!({
                 "operation": "drop_attribute",
@@ -209,25 +211,36 @@ impl Client {
         )
     }
 
-    fn mutation(&self, name: &str, operation: Value) -> Result<Value, PluginError> {
-        self.operation(operation).map_err(|error| {
-            if error.message.contains("timed out") {
-                PluginError::connection(format!(
-                    "Harper {name} outcome is unknown because the request timed out; verify the database state before retrying"
-                ))
-            } else {
-                error
-            }
-        })
+    fn mutation_operation(&self, name: &str, operation: Value) -> Result<Value, PluginError> {
+        self.send_operation(operation, Some(name))
     }
 
     fn operation(&self, operation: Value) -> Result<Value, PluginError> {
+        self.send_operation(operation, None)
+    }
+
+    fn send_operation(
+        &self,
+        operation: Value,
+        mutation_name: Option<&str>,
+    ) -> Result<Value, PluginError> {
         let request = self.authorize(self.http.post(self.endpoint.clone()).json(&operation));
-        let mut response = request
-            .send()
-            .map_err(|error| PluginError::connection(format!("Harper request failed: {error}")))?;
+        let mut response = request.send().map_err(|error| {
+            if let Some(name) = mutation_name.filter(|_| !error.is_connect()) {
+                unknown_mutation_outcome(name, &error.to_string())
+            } else {
+                PluginError::connection(format!("Harper request failed: {error}"))
+            }
+        })?;
         let status = response.status();
-        let body = read_body(&mut response)?;
+        let body = read_body(&mut response).map_err(|error| {
+            if status.is_success() {
+                if let Some(name) = mutation_name {
+                    return unknown_mutation_outcome(name, &error.to_string());
+                }
+            }
+            PluginError::connection(format!("failed to read Harper response: {error}"))
+        })?;
 
         if !status.is_success() {
             return Err(http_error(status, &body));
@@ -237,7 +250,11 @@ impl Client {
         }
 
         serde_json::from_slice(&body).map_err(|error| {
-            PluginError::connection(format!("Harper returned invalid JSON: {error}"))
+            if let Some(name) = mutation_name {
+                unknown_mutation_outcome(name, &format!("Harper returned invalid JSON: {error}"))
+            } else {
+                PluginError::connection(format!("Harper returned invalid JSON: {error}"))
+            }
         })
     }
 
@@ -308,7 +325,12 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
             "Harper host must use http or https",
         ));
     }
-    if required_scheme == "https" && endpoint.scheme() != "https" {
+    let explicit_secure_mode = params
+        .ssl_mode
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|mode| !mode.is_empty() && required_scheme == "https");
+    if explicit_secure_mode && endpoint.scheme() != "https" {
         return Err(PluginError::invalid_params(
             "the selected TLS mode requires an https Harper host",
         ));
@@ -329,7 +351,7 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
 
 fn scheme_for(ssl_mode: Option<&str>) -> Result<&'static str, PluginError> {
     match ssl_mode.map(str::trim).filter(|mode| !mode.is_empty()) {
-        None => Ok("http"),
+        None => Ok("https"),
         Some(mode) => match mode.to_ascii_lowercase().replace('_', "-").as_str() {
             "disable" | "disabled" => Ok("http"),
             "prefer" | "preferred" | "require" | "required" | "verify-ca" | "verify-full"
@@ -359,21 +381,24 @@ fn reject_unsupported_tls_files(params: &ConnectionParams) -> Result<(), PluginE
     Ok(())
 }
 
-fn read_body(response: &mut Response) -> Result<Vec<u8>, PluginError> {
+fn read_body(response: &mut Response) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     response
         .take(MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut body)
-        .map_err(|error| {
-            PluginError::connection(format!("failed to read Harper response: {error}"))
-        })?;
+        .read_to_end(&mut body)?;
     if body.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(PluginError::connection(format!(
+        return Err(std::io::Error::other(format!(
             "Harper response exceeded the {} MiB safety limit",
             MAX_RESPONSE_BYTES / 1024 / 1024
         )));
     }
     Ok(body)
+}
+
+fn unknown_mutation_outcome(name: &str, detail: &str) -> PluginError {
+    PluginError::connection(format!(
+        "Harper {name} outcome is unknown because the response was interrupted ({detail}); verify the database state before retrying"
+    ))
 }
 
 fn http_error(status: StatusCode, body: &[u8]) -> PluginError {
@@ -454,6 +479,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_hosts_default_to_https_unless_tls_is_disabled() {
+        let endpoint = build_endpoint(&params("example.com", None, None)).unwrap();
+        assert_eq!(endpoint.as_str(), "https://example.com:9925/");
+
+        let mut disabled = params("example.com", None, None);
+        disabled.ssl_mode = Some("disabled".to_string());
+        assert_eq!(
+            build_endpoint(&disabled).unwrap().as_str(),
+            "http://example.com:9925/"
+        );
+
+        let explicit_http = build_endpoint(&params("http://example.com", None, None)).unwrap();
+        assert_eq!(explicit_http.as_str(), "http://example.com/");
+    }
+
+    #[test]
     fn tabularis_tls_modes_never_downgrade_to_http() {
         for mode in [
             "prefer",
@@ -507,6 +548,31 @@ mod tests {
         assert!(request.contains(
             r#"{"operation":"insert","database":"data","table":"person","records":[{"name":"Ada"}]}"#
         ));
+    }
+
+    #[test]
+    fn interrupted_success_response_reports_unknown_mutation_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{\"inserted_hashes\":[1]"
+            )
+            .unwrap();
+        });
+        let client = Client::connect(params(&format!("http://{address}"), None, None)).unwrap();
+
+        let error = client
+            .insert("data", "person", serde_json::json!({ "name": "Ada" }))
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.message.contains("outcome is unknown"));
+        assert!(error.message.contains("verify the database state"));
     }
 
     #[test]

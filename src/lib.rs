@@ -207,6 +207,31 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_binary_file_markers_before_any_http_request() {
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "update_record",
+                "params": {
+                    "params": { "host": "http://127.0.0.1:1", "database": "data" },
+                    "table": "person",
+                    "pk_map": { "id": 5 },
+                    "col_name": "photo",
+                    "new_val": "BLOB_FILE_REF:/private/tmp/upload"
+                },
+                "id": 14
+            })
+            .to_string(),
+        );
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("binary upload markers"));
+    }
+
+    #[test]
     fn dispatch_reports_skipped_single_row_write_as_an_error() {
         let (host, _requests, server) = server_responses(vec![
             r#"{"inserted_hashes":[],"skipped_hashes":["existing"]}"#,

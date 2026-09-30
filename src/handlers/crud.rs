@@ -26,6 +26,7 @@ fn insert_record_inner(params: &Value) -> Result<u64, PluginError> {
         .and_then(Value::as_object)
         .cloned()
         .ok_or_else(|| PluginError::invalid_params("data must be an object"))?;
+    reject_tabularis_wire_values(&Value::Object(data.clone()))?;
     let response = client(params)?.insert(&database, table, Value::Object(data))?;
     exactly_one_written(&response, "inserted_hashes", "insert")
 }
@@ -34,6 +35,8 @@ fn update_record_inner(params: &Value) -> Result<u64, PluginError> {
     let database = database(params)?;
     let table = required_string(params, "table")?;
     let column = required_string(params, "col_name")?;
+    let new_value = params.get("new_val").cloned().unwrap_or(Value::Null);
+    reject_tabularis_wire_values(&new_value)?;
     let client = client(params)?;
     let (primary_key, key) = checked_primary_key(&client, params, &database, table)?;
     if column == primary_key {
@@ -44,12 +47,26 @@ fn update_record_inner(params: &Value) -> Result<u64, PluginError> {
 
     let mut record = Map::new();
     record.insert(primary_key, key);
-    record.insert(
-        column.to_string(),
-        params.get("new_val").cloned().unwrap_or(Value::Null),
-    );
+    record.insert(column.to_string(), new_value);
     let response = client.update(&database, table, Value::Object(record))?;
     exactly_one_written(&response, "update_hashes", "update")
+}
+
+fn reject_tabularis_wire_values(value: &Value) -> Result<(), PluginError> {
+    match value {
+        Value::String(value)
+            if value == "__USE_DEFAULT__"
+                || value.starts_with("BLOB:")
+                || value.starts_with("BLOB_FILE_REF:") =>
+        {
+            Err(PluginError::invalid_params(
+                "Tabularis default and binary upload markers are not supported by the Harper driver; enter a JSON value instead",
+            ))
+        }
+        Value::Array(values) => values.iter().try_for_each(reject_tabularis_wire_values),
+        Value::Object(values) => values.values().try_for_each(reject_tabularis_wire_values),
+        _ => Ok(()),
+    }
 }
 
 fn delete_record_inner(params: &Value) -> Result<u64, PluginError> {
@@ -140,7 +157,7 @@ fn client(params: &Value) -> Result<Client, PluginError> {
 mod tests {
     use serde_json::json;
 
-    use super::{exactly_one_written, validate_primary_key_map};
+    use super::{exactly_one_written, reject_tabularis_wire_values, validate_primary_key_map};
 
     #[test]
     fn single_row_writes_require_one_written_hash_and_no_skips() {
@@ -173,5 +190,18 @@ mod tests {
         assert!(validate_primary_key_map(&json!({ "pk_map": { "owner_id": 7 } }), "id").is_err());
         assert!(validate_primary_key_map(&json!({ "pk_map": { "id": null } }), "id").is_err());
         assert!(validate_primary_key_map(&json!({ "pk_map": { "id": "" } }), "id").is_err());
+    }
+
+    #[test]
+    fn tabularis_default_and_blob_markers_are_never_stored_as_strings() {
+        for value in [
+            json!("__USE_DEFAULT__"),
+            json!("BLOB:3:text/plain:YWJj"),
+            json!("BLOB_FILE_REF:/private/tmp/upload"),
+            json!({ "nested": ["BLOB_FILE_REF:/private/tmp/upload"] }),
+        ] {
+            assert!(reject_tabularis_wire_values(&value).is_err());
+        }
+        assert!(reject_tabularis_wire_values(&json!("ordinary text")).is_ok());
     }
 }

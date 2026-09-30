@@ -64,9 +64,8 @@
     {
       "name": "VARCHAR",
       "category": "string",
-      "requires_length": true,
-      "requires_precision": false,
-      "default_length": "255"
+      "requires_length": false,
+      "requires_precision": false
     },
     {
       "name": "BOOLEAN",
