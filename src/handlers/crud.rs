@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use serde_json::{Map, Value};
 
 use crate::client::Client;
@@ -5,6 +9,14 @@ use crate::error::PluginError;
 use crate::handlers::metadata::{database, primary_key};
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::result_response;
+
+const PRIMARY_KEY_CACHE_TTL: Duration = Duration::from_secs(1);
+static PRIMARY_KEY_CACHE: OnceLock<Mutex<HashMap<String, CachedPrimaryKey>>> = OnceLock::new();
+
+struct CachedPrimaryKey {
+    name: String,
+    loaded_at: Instant,
+}
 
 pub fn insert_record(id: Value, params: &Value) -> Value {
     result_response(id, insert_record_inner(params).map(Value::from))
@@ -23,10 +35,12 @@ fn insert_record_inner(params: &Value) -> Result<u64, PluginError> {
     let table = required_string(params, "table")?;
     let data = params
         .get("data")
-        .and_then(Value::as_object)
+        .ok_or_else(|| PluginError::invalid_params("data must be an object"))?;
+    reject_tabularis_wire_values(data)?;
+    let data = data
+        .as_object()
         .cloned()
         .ok_or_else(|| PluginError::invalid_params("data must be an object"))?;
-    reject_tabularis_wire_values(&Value::Object(data.clone()))?;
     let response = client(params)?.insert(&database, table, Value::Object(data))?;
     exactly_one_written(&response, "inserted_hashes", "insert")
 }
@@ -37,19 +51,25 @@ fn update_record_inner(params: &Value) -> Result<u64, PluginError> {
     let column = required_string(params, "col_name")?;
     let new_value = params.get("new_val").cloned().unwrap_or(Value::Null);
     reject_tabularis_wire_values(&new_value)?;
-    let client = client(params)?;
-    let (primary_key, key) = checked_primary_key(&client, params, &database, table)?;
-    if column == primary_key {
+    let (identity_name, key) = row_identity(params)?;
+    if column == identity_name {
         return Err(PluginError::invalid_params(
             "Harper primary-key values cannot be edited in place",
         ));
     }
+    let client = client(params)?;
+    let primary_key = checked_primary_key(&client, params, &database, table)?;
+    if identity_name != primary_key {
+        return Err(PluginError::invalid_params(format!(
+            "row identity must contain only Harper primary key '{primary_key}'"
+        )));
+    }
 
     let mut record = Map::new();
-    record.insert(primary_key, key);
+    record.insert(primary_key, key.clone());
     record.insert(column.to_string(), new_value);
     let response = client.update(&database, table, Value::Object(record))?;
-    exactly_one_written(&response, "update_hashes", "update")
+    exactly_expected_written(&response, "update_hashes", "update", &key)
 }
 
 fn reject_tabularis_wire_values(value: &Value) -> Result<(), PluginError> {
@@ -73,7 +93,13 @@ fn delete_record_inner(params: &Value) -> Result<u64, PluginError> {
     let database = database(params)?;
     let table = required_string(params, "table")?;
     let client = client(params)?;
-    let (_, key) = checked_primary_key(&client, params, &database, table)?;
+    let (identity_name, key) = row_identity(params)?;
+    let primary_key = checked_primary_key(&client, params, &database, table)?;
+    if identity_name != primary_key {
+        return Err(PluginError::invalid_params(format!(
+            "row identity must contain only Harper primary key '{primary_key}'"
+        )));
+    }
     let response = client.delete(&database, table, key)?;
     exactly_one_written(&response, "deleted_hashes", "delete")
 }
@@ -83,34 +109,76 @@ fn checked_primary_key(
     params: &Value,
     database: &str,
     table: &str,
-) -> Result<(String, Value), PluginError> {
+) -> Result<String, PluginError> {
+    let cache_key = primary_key_cache_key(params, database, table);
+    if let Some(primary_key) = cached_primary_key(&cache_key) {
+        return Ok(primary_key);
+    }
     let description = client.describe_table(database, table)?;
     let primary_key = primary_key(&description).ok_or_else(|| {
         PluginError::invalid_params(format!(
             "Harper table '{database}.{table}' has no discoverable primary key"
         ))
     })?;
-    let key = validate_primary_key_map(params, &primary_key)?;
-    Ok((primary_key, key))
+    primary_key_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            cache_key,
+            CachedPrimaryKey {
+                name: primary_key.clone(),
+                loaded_at: Instant::now(),
+            },
+        );
+    Ok(primary_key)
 }
 
-fn validate_primary_key_map(params: &Value, primary_key: &str) -> Result<Value, PluginError> {
+fn row_identity(params: &Value) -> Result<(String, Value), PluginError> {
     let key_map = params
         .get("pk_map")
         .and_then(Value::as_object)
         .ok_or_else(|| PluginError::invalid_params("pk_map must be an object"))?;
-    if key_map.len() != 1 || !key_map.contains_key(primary_key) {
-        return Err(PluginError::invalid_params(format!(
-            "row identity must contain only Harper primary key '{primary_key}'"
-        )));
+    if key_map.len() != 1 {
+        return Err(PluginError::invalid_params(
+            "row identity must contain exactly one Harper primary-key field",
+        ));
     }
-    let key = key_map.get(primary_key).cloned().unwrap_or(Value::Null);
+    let (name, key) = key_map.iter().next().expect("map length was checked");
+    let key = key.clone();
     if key.is_null() || key.as_str().is_some_and(|key| key.trim().is_empty()) {
         return Err(PluginError::invalid_params(
             "Harper primary-key value cannot be null or empty",
         ));
     }
-    Ok(key)
+    Ok((name.clone(), key))
+}
+
+fn primary_key_cache() -> &'static Mutex<HashMap<String, CachedPrimaryKey>> {
+    PRIMARY_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_primary_key(cache_key: &str) -> Option<String> {
+    let mut cache = primary_key_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, cached| cached.loaded_at.elapsed() <= PRIMARY_KEY_CACHE_TTL);
+    cache.get(cache_key).map(|cached| cached.name.clone())
+}
+
+fn primary_key_cache_key(params: &Value, database: &str, table: &str) -> String {
+    let connection = ConnectionParams::from_value(inner_params(params));
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{database}|{table}",
+        connection.host, connection.port, connection.username, connection.ssl_mode,
+    )
+}
+
+pub(crate) fn invalidate_primary_key_cache(params: &Value, database: &str, table: &str) {
+    let cache_key = primary_key_cache_key(params, database, table);
+    primary_key_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&cache_key);
 }
 
 pub(crate) fn exactly_one_written(
@@ -140,6 +208,23 @@ pub(crate) fn exactly_one_written(
     }
 }
 
+fn exactly_expected_written(
+    response: &Value,
+    field: &str,
+    operation: &str,
+    expected_key: &Value,
+) -> Result<u64, PluginError> {
+    exactly_one_written(response, field, operation)?;
+    let written_key = &response[field][0];
+    if written_key == expected_key {
+        Ok(1)
+    } else {
+        Err(PluginError::connection(format!(
+            "Harper committed the {operation} to record key {written_key}, not requested key {expected_key}; verify the database state before retrying"
+        )))
+    }
+}
+
 fn required_string<'a>(params: &'a Value, field: &str) -> Result<&'a str, PluginError> {
     params
         .get(field)
@@ -157,7 +242,9 @@ fn client(params: &Value) -> Result<Client, PluginError> {
 mod tests {
     use serde_json::json;
 
-    use super::{exactly_one_written, reject_tabularis_wire_values, validate_primary_key_map};
+    use super::{
+        exactly_expected_written, exactly_one_written, reject_tabularis_wire_values, row_identity,
+    };
 
     #[test]
     fn single_row_writes_require_one_written_hash_and_no_skips() {
@@ -184,12 +271,31 @@ mod tests {
     #[test]
     fn row_identity_must_be_the_non_null_harper_primary_key() {
         assert_eq!(
-            validate_primary_key_map(&json!({ "pk_map": { "id": 7 } }), "id").unwrap(),
-            7
+            row_identity(&json!({ "pk_map": { "id": 7 } })).unwrap(),
+            ("id".to_string(), json!(7))
         );
-        assert!(validate_primary_key_map(&json!({ "pk_map": { "owner_id": 7 } }), "id").is_err());
-        assert!(validate_primary_key_map(&json!({ "pk_map": { "id": null } }), "id").is_err());
-        assert!(validate_primary_key_map(&json!({ "pk_map": { "id": "" } }), "id").is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": 7, "other": 8 } })).is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": null } })).is_err());
+        assert!(row_identity(&json!({ "pk_map": { "id": "" } })).is_err());
+    }
+
+    #[test]
+    fn update_response_must_name_the_requested_record() {
+        assert!(exactly_expected_written(
+            &json!({ "update_hashes": [7], "skipped_hashes": [] }),
+            "update_hashes",
+            "update",
+            &json!(7)
+        )
+        .is_ok());
+        let error = exactly_expected_written(
+            &json!({ "update_hashes": ["7"], "skipped_hashes": [] }),
+            "update_hashes",
+            "update",
+            &json!(7),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("committed"));
     }
 
     #[test]

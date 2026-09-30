@@ -11,6 +11,8 @@ use crate::rpc::{not_implemented, result_response};
 
 const MAX_UNBOUNDED_ROWS: u64 = 10_000;
 const MAX_PAGE_SIZE: u64 = MAX_UNBOUNDED_ROWS;
+const MAX_RESULT_COLUMNS: usize = 1_000;
+const MAX_PADDING_CELLS: usize = 1_000_000;
 
 pub fn test_connection(id: Value, params: &Value) -> Value {
     let result = client(params)
@@ -86,14 +88,8 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         return write_query_result(response, elapsed);
     }
     match page_size {
-        Some(page_size) => Ok(tabularis_query_result(
-            response,
-            page,
-            page_size,
-            elapsed,
-            server_paged,
-        )),
-        None => Ok(unbounded_query_result(response, elapsed, true)),
+        Some(page_size) => tabularis_query_result(response, page, page_size, elapsed, server_paged),
+        None => unbounded_query_result(response, elapsed, true),
     }
 }
 
@@ -307,7 +303,7 @@ fn tabularis_query_result(
     page_size: u64,
     elapsed: u64,
     server_paged: bool,
-) -> Value {
+) -> Result<Value, PluginError> {
     let mut values = match response {
         Value::Array(values) => values,
         Value::Null => Vec::new(),
@@ -324,7 +320,6 @@ fn tabularis_query_result(
     if server_paged && has_more {
         values.truncate(page_size as usize);
     }
-    let columns = collect_columns(&values);
     let total_count = if server_paged {
         offset
             .saturating_add(values.len())
@@ -333,10 +328,15 @@ fn tabularis_query_result(
         values.len()
     };
     let start = if server_paged { 0 } else { offset };
-    let rows = values
+    let page_values = values
         .into_iter()
         .skip(start)
         .take(page_size as usize)
+        .collect::<Vec<_>>();
+    let (columns, included_rows, _) = bounded_shape(&page_values, false)?;
+    let rows = page_values
+        .into_iter()
+        .take(included_rows)
         .map(|value| row_values(value, &columns))
         .collect::<Vec<_>>();
     let pagination = json!({
@@ -346,7 +346,7 @@ fn tabularis_query_result(
         "has_more": has_more,
     });
 
-    json!({
+    Ok(json!({
         "columns": columns,
         "rows": rows,
         "affected_rows": 0,
@@ -354,25 +354,31 @@ fn tabularis_query_result(
         "pagination": pagination,
         "total_count": total_count,
         "execution_time_ms": elapsed,
-    })
+    }))
 }
 
-fn unbounded_query_result(response: Value, elapsed: u64, cap_enforced: bool) -> Value {
+fn unbounded_query_result(
+    response: Value,
+    elapsed: u64,
+    cap_enforced: bool,
+) -> Result<Value, PluginError> {
     let mut values = match response {
         Value::Array(values) => values,
         Value::Null => Vec::new(),
         value => vec![value],
     };
-    let truncated = cap_enforced && values.len() > MAX_UNBOUNDED_ROWS as usize;
+    let mut truncated = cap_enforced && values.len() > MAX_UNBOUNDED_ROWS as usize;
     if truncated {
         values.truncate(MAX_UNBOUNDED_ROWS as usize);
     }
-    let columns = collect_columns(&values);
+    let (columns, included_rows, shape_truncated) = bounded_shape(&values, true)?;
+    truncated |= shape_truncated;
     let rows = values
         .into_iter()
+        .take(included_rows)
         .map(|value| row_values(value, &columns))
         .collect::<Vec<_>>();
-    json!({
+    Ok(json!({
         "columns": columns,
         "total_count": rows.len(),
         "rows": rows,
@@ -380,7 +386,7 @@ fn unbounded_query_result(response: Value, elapsed: u64, cap_enforced: bool) -> 
         "truncated": truncated,
         "pagination": null,
         "execution_time_ms": elapsed,
-    })
+    }))
 }
 
 fn write_query_result(response: Value, elapsed: u64) -> Result<Value, PluginError> {
@@ -433,25 +439,70 @@ fn mutation_affected_rows(response: &Value) -> Option<usize> {
     })
 }
 
-fn collect_columns(values: &[Value]) -> Vec<String> {
-    let mut columns = Vec::new();
-    let mut seen = HashSet::new();
+fn bounded_shape(
+    values: &[Value],
+    allow_truncate: bool,
+) -> Result<(Vec<String>, usize, bool), PluginError> {
+    let mut columns = Vec::<&str>::new();
+    let mut seen = HashSet::<&str>::new();
+    let mut present_fields = 0_usize;
+    let mut included_rows = 0_usize;
     for value in values {
-        match value {
+        let mut new_columns = Vec::new();
+        let row_fields = match value {
             Value::Object(object) => {
                 for column in object.keys() {
-                    if seen.insert(column.clone()) {
-                        columns.push(column.clone());
+                    if !seen.contains(column.as_str()) {
+                        new_columns.push(column.as_str());
                     }
                 }
+                object.len()
             }
-            _ if seen.insert("value".to_string()) => {
-                columns.push("value".to_string());
+            _ => {
+                if !seen.contains("value") {
+                    new_columns.push("value");
+                }
+                1
             }
-            _ => {}
+        };
+        let candidate_column_count = columns
+            .len()
+            .checked_add(new_columns.len())
+            .ok_or_else(|| PluginError::connection("Harper result shape overflowed"))?;
+        let candidate_row_count = included_rows
+            .checked_add(1)
+            .ok_or_else(|| PluginError::connection("Harper result shape overflowed"))?;
+        let candidate_present = present_fields
+            .checked_add(row_fields)
+            .ok_or_else(|| PluginError::connection("Harper result shape overflowed"))?;
+        let padding_cells = candidate_row_count
+            .checked_mul(candidate_column_count)
+            .and_then(|cells| cells.checked_sub(candidate_present))
+            .ok_or_else(|| PluginError::connection("Harper result shape overflowed"))?;
+        if candidate_column_count > MAX_RESULT_COLUMNS || padding_cells > MAX_PADDING_CELLS {
+            if allow_truncate && included_rows > 0 {
+                return Ok((
+                    columns.into_iter().map(str::to_string).collect(),
+                    included_rows,
+                    true,
+                ));
+            }
+            return Err(PluginError::connection(format!(
+                "Harper result page is too sparse to display safely ({candidate_column_count} columns, {padding_cells} empty cells); select fewer columns or use a smaller page size"
+            )));
         }
+        for column in new_columns {
+            seen.insert(column);
+            columns.push(column);
+        }
+        present_fields = candidate_present;
+        included_rows = candidate_row_count;
     }
-    columns
+    Ok((
+        columns.into_iter().map(str::to_string).collect(),
+        included_rows,
+        false,
+    ))
 }
 
 fn row_values(value: Value, columns: &[String]) -> Vec<Value> {
@@ -475,11 +526,12 @@ fn scalar_row(value: Value, columns: &[String]) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
-        contains_top_level_keyword, normalized_statement, requested_page_size, statement_kind,
-        tabularis_query_result, unbounded_query_result, write_query_result, MAX_UNBOUNDED_ROWS,
+        bounded_shape, contains_top_level_keyword, normalized_statement, requested_page_size,
+        statement_kind, tabularis_query_result, unbounded_query_result, write_query_result,
+        MAX_PADDING_CELLS, MAX_RESULT_COLUMNS, MAX_UNBOUNDED_ROWS,
     };
 
     #[test]
@@ -552,7 +604,7 @@ mod tests {
             { "name": "Ada", "id": 1 },
             { "id": 2, "active": true }
         ]);
-        let result = tabularis_query_result(response, 1, 100, 12, false);
+        let result = tabularis_query_result(response, 1, 100, 12, false).unwrap();
 
         assert_eq!(result["columns"], json!(["name", "id", "active"]));
         assert_eq!(result["rows"], json!([["Ada", 1, null], [null, 2, true]]));
@@ -574,8 +626,8 @@ mod tests {
     #[test]
     fn query_result_paginates_without_rewriting_sql() {
         let response = json!([{ "id": 1 }, { "id": 2 }, { "id": 3 }]);
-        let first_page = tabularis_query_result(response.clone(), 1, 2, 0, false);
-        let second_page = tabularis_query_result(response, 2, 2, 0, false);
+        let first_page = tabularis_query_result(response.clone(), 1, 2, 0, false).unwrap();
+        let second_page = tabularis_query_result(response, 2, 2, 0, false).unwrap();
 
         assert_eq!(first_page["rows"], json!([[1], [2]]));
         assert_eq!(first_page["truncated"], true);
@@ -589,9 +641,41 @@ mod tests {
     }
 
     #[test]
+    fn client_paging_discovers_columns_only_from_the_visible_page() {
+        let response = json!([{ "first": 1 }, { "second": 2 }]);
+        let result = tabularis_query_result(response, 1, 1, 0, false).unwrap();
+
+        assert_eq!(result["columns"], json!(["first"]));
+        assert_eq!(result["rows"], json!([[1]]));
+    }
+
+    #[test]
+    fn sparse_shape_limits_columns_and_padding_before_materialization() {
+        let at_column_limit = (0..MAX_RESULT_COLUMNS)
+            .map(|index| (format!("field_{index}"), json!(index)))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(bounded_shape(&[Value::Object(at_column_limit.clone())], false).is_ok());
+
+        let mut over_column_limit = at_column_limit.clone();
+        over_column_limit.insert("one_too_many".to_string(), json!(true));
+        assert!(bounded_shape(&[Value::Object(over_column_limit)], false).is_err());
+
+        let mut sparse_rows = vec![Value::Object(at_column_limit)];
+        sparse_rows.extend(
+            (0..=(MAX_PADDING_CELLS / MAX_RESULT_COLUMNS))
+                .map(|_| Value::Object(serde_json::Map::new())),
+        );
+        let (_, included_rows, truncated) = bounded_shape(&sparse_rows, true).unwrap();
+        assert_eq!(included_rows, 1 + MAX_PADDING_CELLS / MAX_RESULT_COLUMNS);
+        assert!(truncated);
+        assert!(bounded_shape(&sparse_rows, false).is_err());
+    }
+
+    #[test]
     fn object_responses_are_displayed_as_one_row() {
         let result =
-            tabularis_query_result(json!({ "message": "ok", "count": 1 }), 1, 100, 0, false);
+            tabularis_query_result(json!({ "message": "ok", "count": 1 }), 1, 100, 0, false)
+                .unwrap();
         assert_eq!(result["columns"], json!(["message", "count"]));
         assert_eq!(result["rows"], json!([["ok", 1]]));
     }
@@ -599,7 +683,7 @@ mod tests {
     #[test]
     fn server_paging_uses_an_extra_row_as_a_next_page_signal() {
         let response = json!([{ "id": 1 }, { "id": 2 }, { "id": 3 }]);
-        let result = tabularis_query_result(response, 2, 2, 0, true);
+        let result = tabularis_query_result(response, 2, 2, 0, true).unwrap();
 
         assert_eq!(result["rows"], json!([[1], [2]]));
         assert_eq!(result["total_count"], 5);
@@ -620,7 +704,7 @@ mod tests {
         let rows = (0..=MAX_UNBOUNDED_ROWS)
             .map(|id| json!({ "id": id }))
             .collect();
-        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true);
+        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true).unwrap();
 
         assert_eq!(
             result["rows"].as_array().unwrap().len(),
@@ -651,7 +735,7 @@ mod tests {
         let rows = (0..=MAX_UNBOUNDED_ROWS)
             .map(|id| json!({ "id": id }))
             .collect();
-        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true);
+        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true).unwrap();
 
         assert_eq!(
             result["rows"].as_array().unwrap().len(),

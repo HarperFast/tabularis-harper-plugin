@@ -20,6 +20,7 @@ static HTTP_CLIENT: OnceLock<Result<HttpClient, String>> = OnceLock::new();
 
 pub struct Client {
     endpoint: Url,
+    https_inferred: bool,
     username: Option<String>,
     password: Option<String>,
     http: HttpClient,
@@ -27,6 +28,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(params: ConnectionParams) -> Result<Self, PluginError> {
+        let https_inferred = inferred_https(&params);
         let endpoint = build_endpoint(&params)?;
         let username = params.username.filter(|username| !username.is_empty());
         let password = params.password.filter(|password| !password.is_empty());
@@ -47,6 +49,7 @@ impl Client {
 
         Ok(Self {
             endpoint,
+            https_inferred,
             username,
             password,
             http: shared_http_client()?,
@@ -270,13 +273,53 @@ impl Client {
 
     fn transport_error(&self, context: &str, error: &reqwest::Error) -> PluginError {
         let mut message = format!("{context}: {}", error_detail(error));
-        if self.endpoint.scheme() == "https" {
+        if self.https_inferred && peer_spoke_plain_http(error) {
             message.push_str(
                 "; the connection used HTTPS—if this Harper server intentionally uses plain HTTP, select SSL mode Disabled or enter an explicit http:// host",
             );
         }
         PluginError::connection(message)
     }
+}
+
+fn inferred_https(params: &ConnectionParams) -> bool {
+    let bare_host = params
+        .host
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|host| !host.is_empty() && !host.contains("://"));
+    let mode_is_unset = params
+        .ssl_mode
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    bare_host && mode_is_unset
+}
+
+fn peer_spoke_plain_http(error: &reqwest::Error) -> bool {
+    error_chain_has_invalid_content_type(error)
+}
+
+fn error_chain_has_invalid_content_type(error: &(dyn StdError + 'static)) -> bool {
+    if matches!(
+        error.downcast_ref::<rustls::Error>(),
+        Some(rustls::Error::InvalidMessage(
+            rustls::InvalidMessage::InvalidContentType
+        ))
+    ) {
+        return true;
+    }
+    if let Some(inner) = error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+    {
+        if error_chain_has_invalid_content_type(inner) {
+            return true;
+        }
+    }
+    error
+        .source()
+        .is_some_and(error_chain_has_invalid_content_type)
 }
 
 fn shared_http_client() -> Result<HttpClient, PluginError> {
@@ -609,6 +652,9 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
             let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
         });
         let mut connection = params("127.0.0.1", None, None);
         connection.port = Some(address.port());
@@ -617,9 +663,48 @@ mod tests {
         let error = client.describe_all().unwrap_err();
         server.join().unwrap();
 
-        assert!(error.message.contains("used HTTPS"));
+        assert!(error.message.contains("used HTTPS"), "{}", error.message);
         assert!(error.message.contains("SSL mode Disabled"));
         assert!(error.message.contains("http://"));
+    }
+
+    #[test]
+    fn explicit_https_failure_never_suggests_disabling_tls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let client = Client::connect(params(&format!("https://{address}"), None, None)).unwrap();
+
+        let error = client.describe_all().unwrap_err();
+        server.join().unwrap();
+
+        assert!(!error.message.contains("SSL mode Disabled"));
+    }
+
+    #[test]
+    fn silent_tls_peer_never_suggests_disabling_tls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+        });
+        let mut connection = params("127.0.0.1", None, None);
+        connection.port = Some(address.port());
+        let client = Client::connect(connection).unwrap();
+
+        let error = client.describe_all().unwrap_err();
+        server.join().unwrap();
+
+        assert!(!error.message.contains("SSL mode Disabled"));
     }
 
     #[test]

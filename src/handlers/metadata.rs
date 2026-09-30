@@ -17,7 +17,7 @@ pub fn get_schemas(id: Value, _params: &Value) -> Value {
 }
 
 pub fn get_tables(id: Value, params: &Value) -> Value {
-    let result = database(params).and_then(|database| {
+    let result = read_database(params).and_then(|database| {
         client(params)?
             .describe_database(&database)
             .and_then(table_list)
@@ -203,14 +203,30 @@ fn table(params: &Value) -> Result<String, PluginError> {
 }
 
 fn table_description(params: &Value) -> Result<Value, PluginError> {
-    let database = database(params)?;
+    let database = read_database(params)?;
     let table = table(params)?;
     client(params)?.describe_table(&database, &table)
 }
 
 fn database_metadata(params: &Value) -> Result<Value, PluginError> {
-    let database = database(params)?;
+    let database = read_database(params)?;
     client(params)?.describe_database(&database)
+}
+
+fn read_database(params: &Value) -> Result<String, PluginError> {
+    if let Some(database) = params.get("schema").and_then(non_empty_string) {
+        return Ok(database.to_string());
+    }
+    let database = inner_params(params).get("database");
+    database
+        .and_then(non_empty_string)
+        .or_else(|| {
+            database
+                .and_then(Value::as_array)
+                .and_then(|databases| databases.iter().find_map(non_empty_string))
+        })
+        .map(str::to_string)
+        .ok_or_else(|| PluginError::invalid_params("Harper database is required"))
 }
 
 fn table_descriptions(description: &Value) -> Result<&Map<String, Value>, PluginError> {
@@ -370,7 +386,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        columns_from_description, database, database_names, indexes_from_description, table_list,
+        columns_from_description, database, database_names, indexes_from_description,
+        read_database, table_list,
     };
 
     #[test]
@@ -404,6 +421,17 @@ mod tests {
         .unwrap_err();
 
         assert!(error.message.contains("exactly one Harper database"));
+    }
+
+    #[test]
+    fn schema_less_reads_use_the_primary_connection_database() {
+        let result = read_database(&json!({
+            "params": { "database": ["data", "packages"] },
+            "schema": null
+        }))
+        .unwrap();
+
+        assert_eq!(result, "data");
     }
 
     #[test]

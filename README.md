@@ -70,6 +70,8 @@ The REPL also accepts a complete JSON-RPC request on one line. It calls the same
 
 Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results. Individual pages and Tabularis's **All** mode are limited to 10,000 rows; **All** sets `truncated: true` when more rows exist. The transport also enforces a 16 MiB response ceiling.
 
+Harper documents may have different fields in every row. The plugin discovers all fields on the visible page, but bounds the resulting rectangular grid to 1,000 columns and 1,000,000 empty padding cells. Paged queries return a precise error when that shape is too sparse; **All** mode returns the largest complete prefix and marks it truncated.
+
 ## Harper-specific behavior
 
 - Table creation uses Harper's schema-defined attributes. Declared types and nullability are enforced by current Harper versions, and inserts do not create undeclared attributes automatically.

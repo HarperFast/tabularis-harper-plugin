@@ -178,15 +178,12 @@ mod tests {
 
     #[test]
     fn dispatch_rejects_primary_key_edits_before_mutation() {
-        let (host, requests, server) = server_responses(vec![
-            r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"}]}"#,
-        ]);
         let response = handle_line(
             &json!({
                 "jsonrpc": "2.0",
                 "method": "update_record",
                 "params": {
-                    "params": { "host": host, "database": "data" },
+                    "params": { "host": "http://127.0.0.1:1", "database": "data" },
                     "table": "person",
                     "pk_map": { "id": 5 },
                     "col_name": "id",
@@ -196,14 +193,46 @@ mod tests {
             })
             .to_string(),
         );
-        server.join().unwrap();
-        let requests = requests.recv().unwrap();
 
         assert!(response["error"]["message"]
             .as_str()
             .unwrap()
             .contains("cannot be edited"));
-        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_reuses_a_recent_primary_key_for_update_bursts() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"},{"attribute":"name","type":"String"}]}"#,
+            r#"{"update_hashes":[5],"skipped_hashes":[]}"#,
+            r#"{"update_hashes":[5],"skipped_hashes":[]}"#,
+        ]);
+        let request = |name: &str, id: u64| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "update_record",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "table": "person",
+                    "pk_map": { "id": 5 },
+                    "col_name": "name",
+                    "new_val": name
+                },
+                "id": id
+            })
+        };
+
+        let first = handle_line(&request("Ada", 15).to_string());
+        let second = handle_line(&request("Grace", 16).to_string());
+        assert_eq!(first["result"], 1, "{first}");
+        assert_eq!(second["result"], 1, "{second}");
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains(r#""operation":"describe_table""#));
+        assert!(requests[1].contains(r#""operation":"update""#));
+        assert!(requests[2].contains(r#""operation":"update""#));
     }
 
     #[test]
@@ -284,6 +313,41 @@ mod tests {
     }
 
     #[test]
+    fn schema_less_read_sequence_uses_the_primary_connection_database() {
+        let (host, requests, server) = server_responses(vec![
+            r#"{"person":{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"}]}}"#,
+            r#"{"primary_key":"id","attributes":[{"attribute":"id","type":"Int"}]}"#,
+        ]);
+        let connection = json!({ "host": host, "database": ["data", "staging"] });
+        let tables = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "get_tables",
+                "params": { "params": connection, "schema": null },
+                "id": 19
+            })
+            .to_string(),
+        );
+        let columns = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "get_columns",
+                "params": { "params": connection, "schema": null, "table": "person" },
+                "id": 20
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(tables["result"][0]["name"], "person");
+        assert_eq!(columns["result"][0]["name"], "id");
+        assert!(requests
+            .iter()
+            .all(|request| request.contains(r#""database":"data""#)));
+    }
+
+    #[test]
     fn generated_create_table_executes_one_native_schema_operation() {
         let generated = handle_line(
             &json!({
@@ -324,6 +388,52 @@ mod tests {
         assert!(requests[0].contains(r#""primary_key":"id""#));
         assert!(requests[0].contains(r#""type":"Int""#));
         assert!(requests[0].contains(r#""type":"String""#));
+    }
+
+    #[test]
+    fn generated_add_column_executes_one_native_schema_operation() {
+        let generated = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "get_add_column_sql",
+                "params": {
+                    "params": { "host": "unused", "database": "data" },
+                    "table": "person",
+                    "column": {
+                        "name": "nickname",
+                        "data_type": "ANY",
+                        "is_pk": false,
+                        "is_nullable": true,
+                        "is_auto_increment": false,
+                        "default_value": null
+                    }
+                },
+                "id": 17
+            })
+            .to_string(),
+        );
+        let statement = generated["result"][0].as_str().unwrap();
+        let (host, requests, server) = server_responses(vec![r#"{"message":"attribute created"}"#]);
+        let executed = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": statement
+                },
+                "id": 18
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(executed["result"]["affected_rows"], 0);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(
+            r#"{"operation":"create_attribute","database":"data","table":"person","attribute":"nickname"}"#
+        ));
     }
 
     #[test]

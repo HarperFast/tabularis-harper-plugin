@@ -2,7 +2,8 @@ use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::error::PluginError;
-use crate::handlers::metadata::non_empty_string;
+use crate::handlers::crud::invalidate_primary_key_cache;
+use crate::handlers::metadata::database;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{not_implemented, result_response};
 
@@ -57,26 +58,28 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
         return Some(command.and_then(|command| execute_command(params, &command)));
     }
     if starts_with_keyword(query, "DROP TABLE") {
-        return Some(parse_drop_table(query).and_then(|(database, table)| {
-            let database = database.or_else(|| unambiguous_database(params).ok());
+        return Some(parse_drop_table(query).and_then(|(parsed_database, table)| {
+            let database = parsed_database.or_else(|| database(params).ok());
             let database = database.ok_or_else(|| {
                 PluginError::invalid_params(
                     "DROP TABLE must qualify the Harper database when multiple databases are selected",
                 )
             })?;
             client(params)?.drop_table(&database, &table)?;
+            invalidate_primary_key_cache(params, &database, &table);
             Ok(empty_result())
         }));
     }
     if starts_with_keyword(query, "ALTER TABLE") {
-        return Some(parse_drop_column(query).and_then(|(database, table, attribute)| {
-            let database = database.or_else(|| unambiguous_database(params).ok());
+        return Some(parse_drop_column(query).and_then(|(parsed_database, table, attribute)| {
+            let database = parsed_database.or_else(|| database(params).ok());
             let database = database.ok_or_else(|| {
                 PluginError::invalid_params(
                     "ALTER TABLE must qualify the Harper database when multiple databases are selected",
                 )
             })?;
             client(params)?.drop_attribute(&database, &table, &attribute)?;
+            invalidate_primary_key_cache(params, &database, &table);
             Ok(empty_result())
         }));
     }
@@ -84,7 +87,7 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
 }
 
 fn create_table_sql(params: &Value) -> Result<String, PluginError> {
-    let database = unambiguous_database(params)?;
+    let database = database(params)?;
     reject_host_rewritten_identifier(&database)?;
     let table = required_string(params, "table_name")?;
     reject_host_rewritten_identifier(table)?;
@@ -180,7 +183,7 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
 }
 
 fn add_column_sql(params: &Value) -> Result<String, PluginError> {
-    let database = unambiguous_database(params)?;
+    let database = database(params)?;
     reject_host_rewritten_identifier(&database)?;
     let table = required_string(params, "table")?;
     reject_host_rewritten_identifier(table)?;
@@ -238,10 +241,12 @@ fn execute_command(params: &Value, command: &Value) -> Result<Value, PluginError
                 .cloned()
                 .ok_or_else(|| PluginError::invalid_params("attributes must be an array"))?;
             client.create_table(database, table, primary_key, attributes)?;
+            invalidate_primary_key_cache(params, database, table);
         }
         "create_attribute" => {
             let attribute = required_string(command, "attribute")?;
             client.create_attribute(database, table, attribute)?;
+            invalidate_primary_key_cache(params, database, table);
         }
         _ => {
             return Err(PluginError::invalid_params(
@@ -288,32 +293,6 @@ fn preview_type(native_type: Option<&str>) -> &'static str {
         Some("Bytes") => "BYTES",
         Some("Blob") => "BLOB",
         Some(_) => "ANY",
-    }
-}
-
-fn unambiguous_database(params: &Value) -> Result<String, PluginError> {
-    if let Some(database) = params.get("schema").and_then(non_empty_string) {
-        return Ok(database.to_string());
-    }
-    let database = inner_params(params).get("database");
-    if let Some(database) = database.and_then(non_empty_string) {
-        return Ok(database.to_string());
-    }
-    let databases = database
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(non_empty_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    match databases.as_slice() {
-        [database] => Ok((*database).to_string()),
-        [] => Err(PluginError::invalid_params("Harper database is required")),
-        _ => Err(PluginError::invalid_params(
-            "select exactly one Harper database for schema changes",
-        )),
     }
 }
 
@@ -374,7 +353,7 @@ fn parse_identifier(input: &str) -> Result<(String, &str), PluginError> {
     let end = input
         .char_indices()
         .take_while(|(_, character)| {
-            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+            character.is_alphanumeric() || *character == '_' || *character == '-'
         })
         .map(|(index, character)| index + character.len_utf8())
         .last()
@@ -672,6 +651,10 @@ mod tests {
         assert_eq!(
             parse_drop_table("DROP TABLE `data`.`user;data`").unwrap(),
             (Some("data".to_string()), "user;data".to_string())
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE résumé").unwrap(),
+            (None, "résumé".to_string())
         );
     }
 

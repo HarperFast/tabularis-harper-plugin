@@ -193,6 +193,7 @@ name = "harper-plugin"
 version = "0.1.0"
 dependencies = [
  "reqwest",
+ "rustls",
  "serde_json",
 ]
 
