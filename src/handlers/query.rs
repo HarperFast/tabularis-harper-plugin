@@ -62,7 +62,7 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .into_iter()
         .all(|keyword| !contains_top_level_keyword(&query, keyword));
     let executed_query = if server_paged {
-        format!("{query} LIMIT {} OFFSET {offset}", page_size + 1)
+        format!("{query}\nLIMIT {} OFFSET {offset}", page_size + 1)
     } else {
         query
     };
@@ -93,37 +93,17 @@ fn is_single_select(query: &str) -> bool {
 
 fn normalized_select(query: &str) -> Option<String> {
     let query = query.trim();
-    let mut terminal_semicolon = None;
-    let mut quote = None;
-    let mut chars = query.char_indices().peekable();
-    while let Some((index, character)) = chars.next() {
-        if let Some(active_quote) = quote {
-            if character == active_quote {
-                if chars.peek().is_some_and(|(_, next)| *next == active_quote) {
-                    chars.next();
-                } else {
-                    quote = None;
-                }
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' | '`' => quote = Some(character),
-            ';' => {
-                if terminal_semicolon.is_some() {
-                    return None;
-                }
-                terminal_semicolon = Some(index);
-            }
-            _ => {}
-        }
-    }
-    if quote.is_some() {
+    let scan = scan_sql(query)?;
+    if scan.semicolons.len() > 1 {
         return None;
     }
 
-    let query = match terminal_semicolon {
-        Some(index) if query[index + 1..].trim().is_empty() => query[..index].trim_end(),
+    let normalized;
+    let query = match scan.semicolons.first().copied() {
+        Some(index) if scan.last_code_index == Some(index) => {
+            normalized = format!("{}{}", &query[..index], &query[index + 1..]);
+            normalized.trim()
+        }
         Some(_) => return None,
         None => query,
     };
@@ -142,33 +122,152 @@ fn normalized_select(query: &str) -> Option<String> {
 }
 
 fn contains_top_level_keyword(query: &str, expected: &str) -> bool {
-    let mut quote = None;
+    scan_sql(query).is_some_and(|scan| {
+        scan.top_level_keywords
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case(expected))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    Normal,
+    Quoted(char),
+    Bracketed,
+    LineComment,
+    BlockComment,
+}
+
+struct SqlScan {
+    semicolons: Vec<usize>,
+    last_code_index: Option<usize>,
+    top_level_keywords: Vec<String>,
+}
+
+fn scan_sql(query: &str) -> Option<SqlScan> {
+    let mut state = ScanState::Normal;
     let mut depth = 0_u32;
+    let mut semicolons = Vec::new();
+    let mut last_code_index = None;
+    let mut top_level_keywords = Vec::new();
     let mut word = String::new();
-    for character in query.chars().chain(std::iter::once(' ')) {
-        if let Some(active_quote) = quote {
-            if character == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' | '`' => quote = Some(character),
-            '(' => depth = depth.saturating_add(1),
-            ')' => depth = depth.saturating_sub(1),
-            character if depth == 0 && (character.is_ascii_alphanumeric() || character == '_') => {
-                word.push(character);
-            }
-            _ if depth == 0 => {
-                if word.eq_ignore_ascii_case(expected) {
-                    return true;
+    let mut chars = query.char_indices().peekable();
+
+    while let Some((index, character)) = chars.next() {
+        match state {
+            ScanState::LineComment => {
+                if character == '\n' {
+                    state = ScanState::Normal;
                 }
-                word.clear();
             }
-            _ => {}
+            ScanState::BlockComment => {
+                if character == '*'
+                    && chars
+                        .peek()
+                        .is_some_and(|(_, next_character)| *next_character == '/')
+                {
+                    chars.next();
+                    state = ScanState::Normal;
+                }
+            }
+            ScanState::Bracketed => {
+                last_code_index = Some(index);
+                if character == ']' {
+                    if chars
+                        .peek()
+                        .is_some_and(|(_, next_character)| *next_character == ']')
+                    {
+                        last_code_index = chars.next().map(|(next_index, _)| next_index);
+                    } else {
+                        state = ScanState::Normal;
+                    }
+                }
+            }
+            ScanState::Quoted(quote) => {
+                last_code_index = Some(index);
+                if character == '\\' {
+                    if let Some((next_index, _)) = chars.next() {
+                        last_code_index = Some(next_index);
+                    }
+                } else if character == quote {
+                    if chars
+                        .peek()
+                        .is_some_and(|(_, next_character)| *next_character == quote)
+                    {
+                        last_code_index = chars.next().map(|(next_index, _)| next_index);
+                    } else {
+                        state = ScanState::Normal;
+                    }
+                }
+            }
+            ScanState::Normal => {
+                let next_character = chars.peek().map(|(_, character)| *character);
+                if character == '-' && next_character == Some('-') {
+                    finish_word(&mut word, depth, &mut top_level_keywords);
+                    chars.next();
+                    state = ScanState::LineComment;
+                    continue;
+                }
+                if character == '/' && next_character == Some('*') {
+                    finish_word(&mut word, depth, &mut top_level_keywords);
+                    chars.next();
+                    state = ScanState::BlockComment;
+                    continue;
+                }
+
+                if !character.is_whitespace() {
+                    last_code_index = Some(index);
+                }
+                match character {
+                    '\'' | '"' | '`' => {
+                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        state = ScanState::Quoted(character);
+                    }
+                    '[' => {
+                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        state = ScanState::Bracketed;
+                    }
+                    ';' => {
+                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        semicolons.push(index);
+                    }
+                    '(' => {
+                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        depth = depth.saturating_add(1);
+                    }
+                    ')' => {
+                        word.clear();
+                        depth = depth.saturating_sub(1);
+                    }
+                    character
+                        if depth == 0
+                            && (character.is_ascii_alphanumeric() || character == '_') =>
+                    {
+                        word.push(character);
+                    }
+                    _ => finish_word(&mut word, depth, &mut top_level_keywords),
+                }
+            }
         }
     }
-    false
+    finish_word(&mut word, depth, &mut top_level_keywords);
+
+    match state {
+        ScanState::Normal | ScanState::LineComment => Some(SqlScan {
+            semicolons,
+            last_code_index,
+            top_level_keywords,
+        }),
+        ScanState::Quoted(_) | ScanState::Bracketed | ScanState::BlockComment => None,
+    }
+}
+
+fn finish_word(word: &mut String, depth: u32, keywords: &mut Vec<String>) {
+    if depth == 0 && !word.is_empty() {
+        keywords.push(std::mem::take(word));
+    } else {
+        word.clear();
+    }
 }
 
 fn tabularis_query_result(
@@ -271,7 +370,11 @@ mod tests {
             "SELECT *\nFROM data.dog"
         );
         assert!(normalized_select("SELECT ';' AS punctuation").is_some());
+        assert!(normalized_select("SELECT 1 -- owner's result").is_some());
+        assert!(normalized_select("SELECT 1; -- terminal semicolon").is_some());
         assert!(normalized_select("SELECT 1; DELETE FROM data.dog").is_none());
+        assert!(normalized_select("SELECT 1 -- '\n; DELETE FROM data.dog -- '").is_none());
+        assert!(normalized_select(r#"SELECT 'x\' AS a, '; DELETE FROM data.dog --'"#).is_none());
         assert!(!is_single_select("DELETE FROM data.dog"));
         assert!(normalized_select("-- comment\nSELECT * FROM data.dog").is_none());
     }
@@ -284,6 +387,14 @@ mod tests {
         ));
         assert!(!contains_top_level_keyword(
             "SELECT 'limit' AS value FROM data.dog",
+            "limit"
+        ));
+        assert!(!contains_top_level_keyword(
+            "SELECT * FROM data.dog -- LIMIT 1",
+            "limit"
+        ));
+        assert!(!contains_top_level_keyword(
+            "SELECT * FROM data.dog /* LIMIT 1 */",
             "limit"
         ));
         assert!(!contains_top_level_keyword(
