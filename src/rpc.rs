@@ -5,8 +5,6 @@ use serde_json::{json, Value};
 use crate::error::PluginError;
 use crate::handlers;
 
-/// Parse one JSON-RPC line and return the response value serialized by the
-/// stdio loop. Parse errors and method failures become JSON-RPC errors.
 pub fn handle_line(line: &str) -> Value {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,

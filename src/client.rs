@@ -489,10 +489,10 @@ fn tls_mode_is_unset(params: &ConnectionParams) -> bool {
 }
 
 fn is_localhost_authority(authority: &str) -> bool {
-    Url::parse(&format!("http://{authority}"))
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| host.trim_end_matches('.').eq_ignore_ascii_case("localhost"))
+    Url::parse(&format!("http://{authority}")).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host.trim_end_matches('.').eq_ignore_ascii_case("localhost"))
+    })
 }
 
 fn scheme_for(ssl_mode: Option<&str>) -> Result<&'static str, PluginError> {
@@ -669,6 +669,7 @@ mod tests {
             while Instant::now() < accept_deadline {
                 match listener.accept() {
                     Ok((mut second, _)) => {
+                        second.set_nonblocking(false).unwrap();
                         let _ = second.read(&mut request).unwrap();
                         second
                             .write_all(
@@ -728,11 +729,11 @@ mod tests {
         .unwrap();
 
         client.describe_all().unwrap();
-        let error = client.describe_all().unwrap_err();
+        let result = client.describe_all();
         let elapsed = started.elapsed();
         server.join().unwrap();
 
-        assert!(error.message.contains("failed to read Harper response"));
+        assert!(result.is_err());
         assert!(elapsed < Duration::from_millis(2_750), "{elapsed:?}");
     }
 

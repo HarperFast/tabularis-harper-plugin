@@ -412,6 +412,9 @@ fn sanitize_generated_attributes(
         if is_primary {
             clean["is_primary_key"] = Value::Bool(true);
         }
+        if auto_increment {
+            clean["auto_increment"] = Value::Bool(true);
+        }
         sanitized.push(clean);
     }
     if !primary_key_seen {
@@ -955,12 +958,14 @@ mod tests {
             "nullable": false,
             "indexed": false,
             "is_primary_key": true,
+            "auto_increment": true,
             "hidden_option": "ignored"
         })];
 
         let sanitized = sanitize_generated_attributes(&attributes, "id").unwrap();
 
         assert_eq!(sanitized[0]["indexed"], true);
+        assert_eq!(sanitized[0]["auto_increment"], true);
         assert!(sanitized[0].get("hidden_option").is_none());
     }
 
