@@ -12,6 +12,10 @@ pub fn get_databases(id: Value, params: &Value) -> Value {
     result_response(id, result)
 }
 
+pub fn get_connection_metadata(id: Value) -> Value {
+    ok_response(id, json!({}))
+}
+
 pub fn get_schemas(id: Value, _params: &Value) -> Value {
     ok_response(id, json!([]))
 }

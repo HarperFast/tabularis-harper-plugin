@@ -25,6 +25,7 @@ pub fn handle_line(line: &str) -> Value {
         "initialize" => ok_response(id, Value::Null),
         "ping" => handlers::query::ping(id, &params),
         "test_connection" => handlers::query::test_connection(id, &params),
+        "get_connection_metadata" => handlers::metadata::get_connection_metadata(id),
 
         // Metadata.
         "get_databases" => handlers::metadata::get_databases(id, &params),

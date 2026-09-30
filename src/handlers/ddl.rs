@@ -97,11 +97,15 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
             })?;
             let client = client(params)?;
             let description = client.describe_table(&database, &table)?;
-            if description
+            let schema_defined = description
                 .get("schema_defined")
                 .and_then(Value::as_bool)
-                == Some(true)
-            {
+                .ok_or_else(|| {
+                    PluginError::connection(
+                        "Harper table description did not identify whether the schema is defined",
+                    )
+                })?;
+            if schema_defined {
                 return Err(PluginError::invalid_params(
                     "Harper retains stored values when an attribute is dropped from a schema-defined table; refusing the operation because it would not erase the column data",
                 ));
@@ -130,7 +134,6 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
     }
 
     let mut attributes = Vec::with_capacity(columns.len());
-    let mut preview_columns = Vec::with_capacity(columns.len());
     let mut primary_key = None;
     for column in columns {
         let name = required_string(column, "name")?;
@@ -178,19 +181,10 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
         if is_primary {
             attribute["is_primary_key"] = Value::Bool(true);
         }
-        attributes.push(attribute);
-
-        let mut preview = format!("{} {}", quote_identifier(name), preview_type(native_type));
-        if !nullable {
-            preview.push_str(" NOT NULL");
-        }
-        if is_primary {
-            preview.push_str(" PRIMARY KEY");
-        }
         if auto_increment {
-            preview.push_str(" AUTO_INCREMENT");
+            attribute["auto_increment"] = Value::Bool(true);
         }
-        preview_columns.push(preview);
+        attributes.push(attribute);
     }
     let primary_key = primary_key.ok_or_else(|| {
         PluginError::invalid_params("Harper tables require exactly one primary key")
@@ -202,11 +196,7 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
         "primary_key": primary_key,
         "attributes": attributes,
     });
-    let preview = format!(
-        "CREATE TABLE {} ({})",
-        quote_table(&database, table),
-        preview_columns.join(", ")
-    );
+    let preview = preview_for_command(&command)?;
     Ok(encode_command(&command, &preview))
 }
 
@@ -247,11 +237,7 @@ fn add_column_sql(params: &Value) -> Result<String, PluginError> {
         "table": table,
         "attribute": attribute,
     });
-    let preview = format!(
-        "ALTER TABLE {} ADD COLUMN {} ANY",
-        quote_table(&database, table),
-        quote_identifier(attribute)
-    );
+    let preview = preview_for_command(&command)?;
     Ok(encode_command(&command, &preview))
 }
 
@@ -301,6 +287,15 @@ fn sanitize_generated_attributes(
             .get("is_primary_key")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let auto_increment = attribute
+            .get("auto_increment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if auto_increment && !is_primary {
+            return Err(PluginError::invalid_params(
+                "generated Harper DDL has auto increment on a non-primary attribute",
+            ));
+        }
         if is_primary {
             if name != primary_key || primary_key_seen {
                 return Err(PluginError::invalid_params(
@@ -347,6 +342,67 @@ fn sanitize_generated_attributes(
         ));
     }
     Ok(sanitized)
+}
+
+fn preview_for_command(command: &Value) -> Result<String, PluginError> {
+    let kind = required_string(command, "kind")?;
+    let database = required_string(command, "database")?;
+    let table = required_string(command, "table")?;
+    match kind {
+        "create_table" => {
+            let primary_key = required_string(command, "primary_key")?;
+            let raw_attributes = command
+                .get("attributes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| PluginError::invalid_params("attributes must be an array"))?;
+            let attributes = sanitize_generated_attributes(raw_attributes, primary_key)?;
+            let mut columns = Vec::with_capacity(attributes.len());
+            for (raw, attribute) in raw_attributes.iter().zip(attributes.iter()) {
+                let name = required_string(attribute, "name")?;
+                let native_type = attribute.get("type").and_then(Value::as_str);
+                let nullable = attribute
+                    .get("nullable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let is_primary = attribute
+                    .get("is_primary_key")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let auto_increment = raw
+                    .get("auto_increment")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut column =
+                    format!("{} {}", quote_identifier(name), preview_type(native_type));
+                if !nullable {
+                    column.push_str(" NOT NULL");
+                }
+                if is_primary {
+                    column.push_str(" PRIMARY KEY");
+                }
+                if auto_increment {
+                    column.push_str(" AUTO_INCREMENT");
+                }
+                columns.push(column);
+            }
+            Ok(format!(
+                "CREATE TABLE {} ({})",
+                quote_table(database, table),
+                columns.join(", ")
+            ))
+        }
+        "create_attribute" => {
+            let attribute = required_string(command, "attribute")?;
+            Ok(format!(
+                "ALTER TABLE {} ADD COLUMN {} ANY",
+                quote_table(database, table),
+                quote_identifier(attribute)
+            ))
+        }
+        _ => Err(PluginError::invalid_params(
+            "unsupported generated Harper DDL command",
+        )),
+    }
 }
 
 fn harper_type(data_type: &str) -> Result<Option<&'static str>, PluginError> {
@@ -510,15 +566,22 @@ fn without_sql_comments(query: &str) -> Result<String, PluginError> {
             continue;
         }
         if !quoted_identifier && character == '-' && characters.peek() == Some(&'-') {
-            characters.next();
-            output.push(' ');
-            for character in characters.by_ref() {
-                if character == '\n' {
-                    output.push('\n');
-                    break;
+            let mut lookahead = characters.clone();
+            lookahead.next();
+            if lookahead
+                .peek()
+                .is_none_or(|character| character.is_whitespace())
+            {
+                characters.next();
+                output.push(' ');
+                for character in characters.by_ref() {
+                    if character == '\n' {
+                        output.push('\n');
+                        break;
+                    }
                 }
+                continue;
             }
-            continue;
         }
         if !quoted_identifier && character == '/' && characters.peek() == Some(&'*') {
             characters.next();
@@ -603,8 +666,6 @@ fn reject_host_rewritten_identifier(identifier: &str) -> Result<(), PluginError>
 }
 
 fn encode_command(command: &Value, preview: &str) -> String {
-    let mut command = command.clone();
-    command["preview"] = Value::String(preview.to_string());
     let command = command.to_string();
     let mut encoded = String::with_capacity(command.len() * 2);
     for byte in command.bytes() {
@@ -637,13 +698,8 @@ fn decode_command(query: &str) -> Option<Result<Value, PluginError>> {
         let command: Value = serde_json::from_slice(&bytes).map_err(|_| {
             PluginError::invalid_params("invalid generated Harper DDL command payload")
         })?;
-        let expected_preview = command
-            .get("preview")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                PluginError::invalid_params("generated Harper DDL command has no SQL preview")
-            })?;
-        if normalize_preview(visible_preview) != normalize_preview(expected_preview) {
+        let expected_preview = preview_for_command(&command)?;
+        if normalize_preview(visible_preview) != normalize_preview(&expected_preview) {
             return Err(PluginError::invalid_params(
                 "the generated Harper DDL preview was edited; regenerate the schema change before executing it",
             ));
@@ -713,8 +769,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        add_column_sql, create_table_sql, decode_command, execute_ddl, parse_drop_column,
-        parse_drop_table, sanitize_generated_attributes,
+        add_column_sql, create_table_sql, decode_command, encode_command, execute_ddl,
+        parse_drop_column, parse_drop_table, sanitize_generated_attributes,
     };
 
     #[test]
@@ -750,6 +806,26 @@ mod tests {
         let edited = sql.replacen("`person`", "`other`", 1);
 
         assert!(decode_command(&edited)
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("was edited"));
+    }
+
+    #[test]
+    fn generated_ddl_binds_visible_preview_to_executable_fields() {
+        let command = json!({
+            "kind": "create_attribute",
+            "database": "production",
+            "table": "shadow",
+            "attribute": "secret"
+        });
+        let disguised = encode_command(
+            &command,
+            "ALTER TABLE `data`.`notes` ADD COLUMN `title` ANY",
+        );
+
+        assert!(decode_command(&disguised)
             .unwrap()
             .unwrap_err()
             .message
@@ -834,6 +910,14 @@ mod tests {
         assert_eq!(
             parse_drop_table("DROP TABLE `data`.`person` -- old; table").unwrap(),
             (Some("data".to_string()), "person".to_string(), false)
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE data.person--backup").unwrap(),
+            (
+                Some("data".to_string()),
+                "person--backup".to_string(),
+                false
+            )
         );
     }
 

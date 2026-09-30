@@ -52,6 +52,16 @@ mod tests {
         let manifest: Value = serde_json::from_str(include_str!("../.tabularium")).unwrap();
 
         assert_eq!(manifest["capabilities"]["identifier_quote"], "`");
+        assert_eq!(manifest["connection_metadata"], true);
+    }
+
+    #[test]
+    fn connection_metadata_opt_in_returns_empty_overrides() {
+        let response = handle_line(
+            r#"{"jsonrpc":"2.0","method":"get_connection_metadata","params":{},"id":28}"#,
+        );
+
+        assert_eq!(response["result"], json!({}));
     }
 
     #[test]
@@ -450,6 +460,32 @@ mod tests {
         assert_eq!(response["result"]["affected_rows"], 0, "{response}");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains(r#""operation":"drop_attribute""#));
+    }
+
+    #[test]
+    fn drop_column_requires_explicit_schema_kind_metadata() {
+        let (host, _requests, server) = server_responses(vec![
+            r#"{"primary_key":"id","attributes":[{"attribute":"id"},{"attribute":"nickname"}]}"#,
+        ]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host, "database": "data" },
+                    "query": "ALTER TABLE `data`.`person` DROP COLUMN `nickname`"
+                },
+                "id": 29
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+
+        assert_eq!(response["error"]["code"], -32001, "{response}");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("schema is defined"));
     }
 
     #[test]

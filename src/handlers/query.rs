@@ -136,7 +136,8 @@ fn require_qualified_write_target(query: &str, kind: &str) -> Result<(), PluginE
     }
     let rest = consume_sql_identifier(rest)
         .ok_or_else(|| PluginError::invalid_params("SQL write target must be database.table"))?;
-    let rest = rest.trim_start();
+    let rest = skip_sql_separators(rest)
+        .ok_or_else(|| PluginError::invalid_params("SQL contains an unterminated comment"))?;
     let Some(rest) = rest.strip_prefix('.') else {
         return Err(PluginError::invalid_params(
             "SQL INSERT, UPDATE, and DELETE targets must be qualified as database.table",
@@ -150,28 +151,31 @@ fn require_qualified_write_target(query: &str, kind: &str) -> Result<(), PluginE
     Ok(())
 }
 
-fn strip_leading_comments(mut query: &str) -> Result<&str, PluginError> {
+fn strip_leading_comments(query: &str) -> Result<&str, PluginError> {
+    skip_sql_separators(query)
+        .ok_or_else(|| PluginError::invalid_params("SQL contains an unterminated comment"))
+}
+
+fn skip_sql_separators(mut input: &str) -> Option<&str> {
     loop {
-        query = query.trim_start();
-        if let Some(comment) = query.strip_prefix("--") {
-            query = comment
+        input = input.trim_start();
+        if let Some(comment) = input.strip_prefix("--") {
+            input = comment
                 .split_once('\n')
                 .map_or("", |(_, remainder)| remainder);
             continue;
         }
-        if let Some(comment) = query.strip_prefix("/*") {
-            let (_, remainder) = comment.split_once("*/").ok_or_else(|| {
-                PluginError::invalid_params("SQL contains an unterminated comment")
-            })?;
-            query = remainder;
+        if let Some(comment) = input.strip_prefix("/*") {
+            let (_, remainder) = comment.split_once("*/")?;
+            input = remainder;
             continue;
         }
-        return Ok(query);
+        return Some(input);
     }
 }
 
 fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
-    let input = input.trim_start();
+    let input = skip_sql_separators(input)?;
     let prefix = input.get(..keyword.len())?;
     if !prefix.eq_ignore_ascii_case(keyword) {
         return None;
@@ -182,7 +186,7 @@ fn strip_sql_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
 }
 
 fn consume_sql_identifier(input: &str) -> Option<&str> {
-    let input = input.trim_start();
+    let input = skip_sql_separators(input)?;
     if let Some(mut rest) = input.strip_prefix('`') {
         loop {
             let index = rest.find('`')?;
@@ -201,6 +205,10 @@ fn consume_sql_identifier(input: &str) -> Option<&str> {
         })
         .map(|(index, character)| index + character.len_utf8())
         .last()?;
+    let identifier = &input[..end];
+    if identifier.contains("--") {
+        return None;
+    }
     Some(&input[end..])
 }
 
@@ -668,6 +676,7 @@ mod tests {
     fn sql_writes_require_database_qualified_targets() {
         for (query, kind) in [
             ("INSERT INTO data.dog (id) VALUES (1)", "INSERT"),
+            ("INSERT /* hint */ INTO data.dog (id) VALUES (1)", "INSERT"),
             ("UPDATE `data`.`dog` SET name = 'Rover'", "UPDATE"),
             ("-- scoped\nDELETE FROM data.dog WHERE id = 1", "DELETE"),
         ] {
@@ -680,6 +689,7 @@ mod tests {
             ("INSERT INTO dog (id) VALUES (1)", "INSERT"),
             ("UPDATE dog SET name = 'Rover'", "UPDATE"),
             ("DELETE FROM dog WHERE id = 1", "DELETE"),
+            ("INSERT INTO dog--.x\n(id) VALUES (1)", "INSERT"),
         ] {
             assert!(
                 require_qualified_write_target(query, kind).is_err(),

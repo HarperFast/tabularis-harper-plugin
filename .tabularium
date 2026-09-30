@@ -51,6 +51,12 @@
       "requires_precision": false
     },
     {
+      "name": "LONG",
+      "category": "numeric",
+      "requires_length": false,
+      "requires_precision": false
+    },
+    {
       "name": "FLOAT",
       "category": "numeric",
       "requires_length": false,
