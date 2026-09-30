@@ -53,7 +53,7 @@ mod tests {
 
         assert_eq!(manifest["name"], "harper");
         assert_eq!(manifest["engine"], "harper");
-        assert_eq!(manifest["executable"], "harper");
+        assert_eq!(manifest["executable"], env!("CARGO_PKG_NAME"));
         assert_eq!(manifest["capabilities"]["identifier_quote"], "`");
         assert_eq!(manifest["connection_metadata"], true);
     }

@@ -384,7 +384,12 @@ fn shared_http_client() -> Result<HttpClient, PluginError> {
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(REQUEST_TIMEOUT)
                 .redirect(Policy::none())
-                .user_agent(concat!("harper/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!(
+                    env!("CARGO_PKG_NAME"),
+                    "/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (tabularis)"
+                ))
                 .build()
                 .map_err(|error| error.to_string())
         })
