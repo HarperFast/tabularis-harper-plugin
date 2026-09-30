@@ -315,7 +315,7 @@ fn preview_type(native_type: Option<&str>) -> &'static str {
 
 fn parse_drop_table(query: &str) -> Result<(Option<String>, String, bool), PluginError> {
     let query = one_statement(query)?;
-    let rest = strip_keyword(query, "DROP TABLE")
+    let rest = strip_keyword(&query, "DROP TABLE")
         .ok_or_else(|| PluginError::invalid_params("expected a single DROP TABLE statement"))?;
     let (rest, if_exists) = match strip_keyword(rest, "IF EXISTS") {
         Some(rest) => (rest, true),
@@ -328,7 +328,7 @@ fn parse_drop_table(query: &str) -> Result<(Option<String>, String, bool), Plugi
 
 fn parse_drop_column(query: &str) -> Result<(Option<String>, String, String), PluginError> {
     let query = one_statement(query)?;
-    let rest = strip_keyword(query, "ALTER TABLE")
+    let rest = strip_keyword(&query, "ALTER TABLE")
         .ok_or_else(|| PluginError::invalid_params("expected a single ALTER TABLE statement"))?;
     let (database, table, rest) = parse_table_reference(rest)?;
     let rest = strip_keyword(rest, "DROP COLUMN").ok_or_else(|| {
@@ -384,7 +384,8 @@ fn parse_identifier(input: &str) -> Result<(String, &str), PluginError> {
     Ok((input[..end].to_string(), &input[end..]))
 }
 
-fn one_statement(query: &str) -> Result<&str, PluginError> {
+fn one_statement(query: &str) -> Result<String, PluginError> {
+    let query = without_sql_comments(query)?;
     let query = query.trim();
     let mut quoted_identifier = false;
     let mut semicolons = Vec::new();
@@ -415,7 +416,61 @@ fn one_statement(query: &str) -> Result<&str, PluginError> {
     }
     Ok(semicolons
         .first()
-        .map_or(query, |index| query[..*index].trim_end()))
+        .map_or(query, |index| query[..*index].trim_end())
+        .to_string())
+}
+
+fn without_sql_comments(query: &str) -> Result<String, PluginError> {
+    let mut output = String::with_capacity(query.len());
+    let mut characters = query.chars().peekable();
+    let mut quoted_identifier = false;
+    while let Some(character) = characters.next() {
+        if character == '`' {
+            output.push(character);
+            if quoted_identifier && characters.peek() == Some(&'`') {
+                output.push(characters.next().expect("peeked character exists"));
+            } else {
+                quoted_identifier = !quoted_identifier;
+            }
+            continue;
+        }
+        if !quoted_identifier && character == '-' && characters.peek() == Some(&'-') {
+            characters.next();
+            output.push(' ');
+            for character in characters.by_ref() {
+                if character == '\n' {
+                    output.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        if !quoted_identifier && character == '/' && characters.peek() == Some(&'*') {
+            characters.next();
+            output.push(' ');
+            let mut closed = false;
+            while let Some(character) = characters.next() {
+                if character == '*' && characters.peek() == Some(&'/') {
+                    characters.next();
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                return Err(PluginError::invalid_params(
+                    "schema change contains an unterminated comment",
+                ));
+            }
+            continue;
+        }
+        output.push(character);
+    }
+    if quoted_identifier {
+        return Err(PluginError::invalid_params(
+            "schema change contains an unterminated quoted identifier",
+        ));
+    }
+    Ok(output)
 }
 
 fn starts_with_keyword(query: &str, keyword: &str) -> bool {
@@ -429,7 +484,8 @@ fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
         return None;
     }
     let rest = &input[keyword.len()..];
-    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(rest)
+    (rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('`'))
+        .then_some(rest)
 }
 
 fn ensure_empty(rest: &str) -> Result<(), PluginError> {
@@ -678,6 +734,14 @@ mod tests {
         assert_eq!(
             parse_drop_table("DROP TABLE IF EXISTS `data`.`person`").unwrap(),
             (Some("data".to_string()), "person".to_string(), true)
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE`data`.`person`; -- old table").unwrap(),
+            (Some("data".to_string()), "person".to_string(), false)
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE `data`.`person` -- old; table").unwrap(),
+            (Some("data".to_string()), "person".to_string(), false)
         );
     }
 

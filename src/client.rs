@@ -252,6 +252,12 @@ impl Client {
             return Err(http_error(status, &body));
         }
         if body.is_empty() {
+            if let Some(name) = mutation_name {
+                return Err(unknown_mutation_outcome(
+                    name,
+                    "Harper returned an empty success response",
+                ));
+            }
             return Ok(Value::Null);
         }
 
@@ -641,6 +647,18 @@ mod tests {
         server.join().unwrap();
 
         assert!(error.message.contains("outcome is unknown"));
+        assert!(error.message.contains("verify the database state"));
+    }
+
+    #[test]
+    fn empty_success_response_reports_unknown_mutation_outcome() {
+        let (host, _request) = server("200 OK", "");
+        let client = Client::connect(params(&host, None, None)).unwrap();
+
+        let error = client.drop_table("data", "person").unwrap_err();
+
+        assert!(error.message.contains("outcome is unknown"));
+        assert!(error.message.contains("empty success response"));
         assert!(error.message.contains("verify the database state"));
     }
 
