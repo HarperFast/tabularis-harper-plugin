@@ -183,7 +183,7 @@ mod tests {
                 "method": "delete_record",
                 "params": {
                     "params": { "host": host, "database": "data" },
-                    "table": "person",
+                    "table": "identity_validation_test",
                     "pk_map": { "owner_id": 5 }
                 },
                 "id": 7
