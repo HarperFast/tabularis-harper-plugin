@@ -85,7 +85,9 @@ pub(crate) fn execute_ddl(params: &Value, query: &str) -> Option<Result<Value, P
 
 fn create_table_sql(params: &Value) -> Result<String, PluginError> {
     let database = unambiguous_database(params)?;
+    reject_host_rewritten_identifier(&database)?;
     let table = required_string(params, "table_name")?;
+    reject_host_rewritten_identifier(table)?;
     let columns = params
         .get("columns")
         .and_then(Value::as_array)
@@ -101,6 +103,7 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
     let mut primary_key = None;
     for column in columns {
         let name = required_string(column, "name")?;
+        reject_host_rewritten_identifier(name)?;
         let data_type = required_string(column, "data_type")?;
         let native_type = harper_type(data_type)?;
         let is_primary = column.get("is_pk").and_then(Value::as_bool) == Some(true);
@@ -178,11 +181,14 @@ fn create_table_sql(params: &Value) -> Result<String, PluginError> {
 
 fn add_column_sql(params: &Value) -> Result<String, PluginError> {
     let database = unambiguous_database(params)?;
+    reject_host_rewritten_identifier(&database)?;
     let table = required_string(params, "table")?;
+    reject_host_rewritten_identifier(table)?;
     let column = params
         .get("column")
         .ok_or_else(|| PluginError::invalid_params("column is required"))?;
     let attribute = required_string(column, "name")?;
+    reject_host_rewritten_identifier(attribute)?;
     let data_type = required_string(column, "data_type")?;
     if harper_type(data_type)?.is_some() {
         return Err(PluginError::invalid_params(
@@ -381,13 +387,36 @@ fn parse_identifier(input: &str) -> Result<(String, &str), PluginError> {
 
 fn one_statement(query: &str) -> Result<&str, PluginError> {
     let query = query.trim();
-    let query = query.strip_suffix(';').unwrap_or(query).trim_end();
-    if query.contains(';') {
+    let mut quoted_identifier = false;
+    let mut semicolons = Vec::new();
+    let mut characters = query.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if character == '`' {
+            if quoted_identifier
+                && characters
+                    .peek()
+                    .is_some_and(|(_, next_character)| *next_character == '`')
+            {
+                characters.next();
+            } else {
+                quoted_identifier = !quoted_identifier;
+            }
+        } else if character == ';' && !quoted_identifier {
+            semicolons.push(index);
+        }
+    }
+    if semicolons.len() > 1
+        || semicolons
+            .first()
+            .is_some_and(|index| *index != query.len() - 1)
+    {
         return Err(PluginError::invalid_params(
             "schema changes accept exactly one statement",
         ));
     }
-    Ok(query)
+    Ok(semicolons
+        .first()
+        .map_or(query, |index| query[..*index].trim_end()))
 }
 
 fn starts_with_keyword(query: &str, keyword: &str) -> bool {
@@ -429,6 +458,18 @@ fn quote_identifier(identifier: &str) -> String {
 
 fn quote_table(database: &str, table: &str) -> String {
     format!("{}.{}", quote_identifier(database), quote_identifier(table))
+}
+
+fn reject_host_rewritten_identifier(identifier: &str) -> Result<(), PluginError> {
+    if identifier
+        .chars()
+        .any(|character| matches!(character, '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}'))
+    {
+        return Err(PluginError::invalid_params(format!(
+            "identifier '{identifier}' contains a typographic quote that Tabularis rewrites before execution"
+        )));
+    }
+    Ok(())
 }
 
 fn encode_command(command: &Value, preview: &str) -> String {
@@ -483,7 +524,43 @@ fn decode_command(query: &str) -> Option<Result<Value, PluginError>> {
 }
 
 fn normalize_preview(preview: &str) -> String {
-    preview.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut normalized = String::new();
+    let mut quoted = None;
+    let mut pending_space = false;
+    let mut characters = preview.trim().chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(quote) = quoted {
+            normalized.push(character);
+            if character == quote {
+                if characters
+                    .peek()
+                    .is_some_and(|next_character| *next_character == quote)
+                {
+                    normalized.push(characters.next().expect("peeked character exists"));
+                } else {
+                    quoted = None;
+                }
+            }
+            continue;
+        }
+        if matches!(character, '`' | '\'' | '"') {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            normalized.push(character);
+            quoted = Some(character);
+        } else if character.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            normalized.push(character);
+        }
+    }
+    normalized
 }
 
 fn client(params: &Value) -> Result<Client, PluginError> {
@@ -551,6 +628,34 @@ mod tests {
     }
 
     #[test]
+    fn generated_ddl_preserves_whitespace_inside_quoted_identifiers() {
+        let sql = create_table_sql(&json!({
+            "params": { "database": "data" },
+            "table_name": "person",
+            "columns": [
+                { "name": "first name", "data_type": "TEXT", "is_pk": true, "is_nullable": false, "is_auto_increment": false, "default_value": null }
+            ]
+        }))
+        .unwrap();
+        let edited = sql.replacen("`first name`", "`first  name`", 1);
+
+        assert!(decode_command(&edited).unwrap().is_err());
+    }
+
+    #[test]
+    fn generated_ddl_rejects_identifiers_the_host_would_rewrite() {
+        let result = create_table_sql(&json!({
+            "params": { "database": "data" },
+            "table_name": "person",
+            "columns": [
+                { "name": "owner’s note", "data_type": "TEXT", "is_pk": true, "is_nullable": false, "is_auto_increment": false, "default_value": null }
+            ]
+        }));
+
+        assert!(result.unwrap_err().message.contains("typographic quote"));
+    }
+
+    #[test]
     fn parses_host_generated_drop_statements() {
         assert_eq!(
             parse_drop_table("DROP TABLE `data`.`odd``table`").unwrap(),
@@ -563,6 +668,10 @@ mod tests {
                 "person".to_string(),
                 "age".to_string()
             )
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE `data`.`user;data`").unwrap(),
+            (Some("data".to_string()), "user;data".to_string())
         );
     }
 

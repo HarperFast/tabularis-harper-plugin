@@ -63,8 +63,8 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .into_iter()
         .any(|keyword| contains_top_level_keyword(&query, keyword));
     let server_paged = is_select && page_size.is_some() && !has_paging_clause;
-    let unbounded_capped = is_select && page_size.is_none() && !has_paging_clause;
-    let executed_query = match (page_size, server_paged, unbounded_capped) {
+    let unbounded_needs_server_cap = is_select && page_size.is_none() && !has_paging_clause;
+    let executed_query = match (page_size, server_paged, unbounded_needs_server_cap) {
         (Some(page_size), true, _) => {
             let offset = (page - 1).saturating_mul(page_size);
             format!("{query}\nLIMIT {} OFFSET {offset}", page_size + 1)
@@ -93,7 +93,7 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
             elapsed,
             server_paged,
         )),
-        None => Ok(unbounded_query_result(response, elapsed, unbounded_capped)),
+        None => Ok(unbounded_query_result(response, elapsed, true)),
     }
 }
 
@@ -384,16 +384,39 @@ fn unbounded_query_result(response: Value, elapsed: u64, cap_enforced: bool) -> 
 }
 
 fn write_query_result(response: Value, elapsed: u64) -> Result<Value, PluginError> {
+    let affected_rows = mutation_affected_rows(&response);
     let skipped = response
         .get("skipped_hashes")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     if skipped > 0 {
-        return Err(PluginError::connection(format!(
-            "Harper skipped {skipped} record(s) while executing the SQL mutation"
-        )));
+        return Err(PluginError::connection(match affected_rows {
+            Some(written) => format!(
+                "Harper committed {written} record(s) and skipped {skipped} record(s); the committed records remain written"
+            ),
+            None => format!(
+                "Harper skipped {skipped} record(s) and may have committed others; verify the database state before retrying"
+            ),
+        }));
     }
-    let affected_rows = [
+    let affected_rows = affected_rows.ok_or_else(|| {
+        PluginError::connection(
+            "Harper write response did not include a recognized affected-record count",
+        )
+    })?;
+    Ok(json!({
+        "columns": [],
+        "rows": [],
+        "affected_rows": affected_rows,
+        "truncated": false,
+        "pagination": null,
+        "total_count": 0,
+        "execution_time_ms": elapsed,
+    }))
+}
+
+fn mutation_affected_rows(response: &Value) -> Option<usize> {
+    [
         "inserted_hashes",
         "update_hashes",
         "deleted_hashes",
@@ -408,20 +431,6 @@ fn write_query_result(response: Value, elapsed: u64) -> Result<Value, PluginErro
             .and_then(Value::as_u64)
             .map(|affected_rows| affected_rows as usize)
     })
-    .ok_or_else(|| {
-        PluginError::connection(
-            "Harper write response did not include a recognized affected-record count",
-        )
-    })?;
-    Ok(json!({
-        "columns": [],
-        "rows": [],
-        "affected_rows": affected_rows,
-        "truncated": false,
-        "pagination": null,
-        "total_count": 0,
-        "execution_time_ms": elapsed,
-    }))
 }
 
 fn collect_columns(values: &[Value]) -> Vec<String> {
@@ -632,8 +641,22 @@ mod tests {
             write_query_result(json!({ "update_hashes": [1], "skipped_hashes": [2] }), 4)
                 .unwrap_err()
                 .message
-                .contains("skipped 1")
+                .contains("committed 1 record(s) and skipped 1")
         );
         assert!(write_query_result(json!({ "message": "ok" }), 0).is_err());
+    }
+
+    #[test]
+    fn unbounded_results_with_an_explicit_sql_limit_are_still_capped() {
+        let rows = (0..=MAX_UNBOUNDED_ROWS)
+            .map(|id| json!({ "id": id }))
+            .collect();
+        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true);
+
+        assert_eq!(
+            result["rows"].as_array().unwrap().len(),
+            MAX_UNBOUNDED_ROWS as usize
+        );
+        assert_eq!(result["truncated"], true);
     }
 }

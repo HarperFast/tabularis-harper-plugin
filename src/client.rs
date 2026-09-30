@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -56,9 +57,11 @@ impl Client {
         let url = self.endpoint.join("health").map_err(|error| {
             PluginError::invalid_params(format!("invalid Harper health URL: {error}"))
         })?;
-        let mut response = self.http.get(url).send().map_err(|error| {
-            PluginError::connection(format!("Harper health check failed: {error}"))
-        })?;
+        let mut response = self
+            .http
+            .get(url)
+            .send()
+            .map_err(|error| self.transport_error("Harper health check failed", &error))?;
         let status = response.status();
         let body = read_body(&mut response).map_err(|error| {
             PluginError::connection(format!("failed to read Harper response: {error}"))
@@ -227,9 +230,9 @@ impl Client {
         let request = self.authorize(self.http.post(self.endpoint.clone()).json(&operation));
         let mut response = request.send().map_err(|error| {
             if let Some(name) = mutation_name.filter(|_| !error.is_connect()) {
-                unknown_mutation_outcome(name, &error.to_string())
+                unknown_mutation_outcome(name, &error_detail(&error))
             } else {
-                PluginError::connection(format!("Harper request failed: {error}"))
+                self.transport_error("Harper request failed", &error)
             }
         })?;
         let status = response.status();
@@ -263,6 +266,16 @@ impl Client {
             (Some(username), Some(password)) => request.basic_auth(username, Some(password)),
             _ => request,
         }
+    }
+
+    fn transport_error(&self, context: &str, error: &reqwest::Error) -> PluginError {
+        let mut message = format!("{context}: {}", error_detail(error));
+        if self.endpoint.scheme() == "https" {
+            message.push_str(
+                "; the connection used HTTPS—if this Harper server intentionally uses plain HTTP, select SSL mode Disabled or enter an explicit http:// host",
+            );
+        }
+        PluginError::connection(message)
     }
 }
 
@@ -399,6 +412,19 @@ fn unknown_mutation_outcome(name: &str, detail: &str) -> PluginError {
     PluginError::connection(format!(
         "Harper {name} outcome is unknown because the response was interrupted ({detail}); verify the database state before retrying"
     ))
+}
+
+fn error_detail(error: &reqwest::Error) -> String {
+    let mut details = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if !details.iter().any(|existing| existing == &detail) {
+            details.push(detail);
+        }
+        source = cause.source();
+    }
+    details.join(": ")
 }
 
 fn http_error(status: StatusCode, body: &[u8]) -> PluginError {
@@ -573,6 +599,27 @@ mod tests {
 
         assert!(error.message.contains("outcome is unknown"));
         assert!(error.message.contains("verify the database state"));
+    }
+
+    #[test]
+    fn default_https_failure_explains_how_to_use_intentional_plain_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+        });
+        let mut connection = params("127.0.0.1", None, None);
+        connection.port = Some(address.port());
+        let client = Client::connect(connection).unwrap();
+
+        let error = client.describe_all().unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.message.contains("used HTTPS"));
+        assert!(error.message.contains("SSL mode Disabled"));
+        assert!(error.message.contains("http://"));
     }
 
     #[test]

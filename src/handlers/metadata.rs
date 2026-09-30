@@ -160,20 +160,29 @@ fn client(params: &Value) -> Result<Client, PluginError> {
 }
 
 pub(crate) fn database(params: &Value) -> Result<String, PluginError> {
-    params
-        .get("schema")
-        .and_then(non_empty_string)
-        .or_else(|| {
-            inner_params(params).get("database").and_then(|database| {
-                non_empty_string(database).or_else(|| {
-                    database
-                        .as_array()
-                        .and_then(|databases| databases.iter().find_map(non_empty_string))
-                })
-            })
+    if let Some(database) = params.get("schema").and_then(non_empty_string) {
+        return Ok(database.to_string());
+    }
+    let database = inner_params(params).get("database");
+    if let Some(database) = database.and_then(non_empty_string) {
+        return Ok(database.to_string());
+    }
+    let databases = database
+        .and_then(Value::as_array)
+        .map(|databases| {
+            databases
+                .iter()
+                .filter_map(non_empty_string)
+                .collect::<Vec<_>>()
         })
-        .map(str::to_string)
-        .ok_or_else(|| PluginError::invalid_params("Harper database is required"))
+        .unwrap_or_default();
+    match databases.as_slice() {
+        [database] => Ok((*database).to_string()),
+        [] => Err(PluginError::invalid_params("Harper database is required")),
+        _ => Err(PluginError::invalid_params(
+            "select exactly one Harper database for this operation",
+        )),
+    }
 }
 
 pub(crate) fn non_empty_string(value: &Value) -> Option<&str> {
@@ -376,14 +385,25 @@ mod tests {
     }
 
     #[test]
-    fn uses_primary_connection_database_without_a_per_call_selection() {
+    fn uses_single_connection_database_without_a_per_call_selection() {
         let result = database(&json!({
-            "params": { "database": ["data", "packages"] },
+            "params": { "database": ["data"] },
             "schema": null
         }))
         .unwrap();
 
         assert_eq!(result, "data");
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_multi_database_request() {
+        let error = database(&json!({
+            "params": { "database": ["data", "packages"] },
+            "schema": null
+        }))
+        .unwrap_err();
+
+        assert!(error.message.contains("exactly one Harper database"));
     }
 
     #[test]
