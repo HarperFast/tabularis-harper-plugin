@@ -718,6 +718,39 @@ mod tests {
             .contains(r#"{"operation":"drop_table","database":"staging","table":"person"}"#));
     }
 
+    #[test]
+    fn all_mode_caps_a_user_written_sql_limit_without_rewriting_it() {
+        let cap = crate::handlers::query::MAX_UNBOUNDED_ROWS as usize;
+        let rows = (0..=cap)
+            .map(|id| format!(r#"{{"id":{id}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body: &'static str = Box::leak(format!("[{rows}]").into_boxed_str());
+        let (host, requests, server) = server_responses(vec![body]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host },
+                    "query": "SELECT * FROM data.person LIMIT 50000",
+                    "page": 1,
+                    "limit": null
+                },
+                "id": 31
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert!(requests[0].contains("SELECT * FROM data.person LIMIT 50000"));
+        assert!(!requests[0].contains("LIMIT 10001"), "{}", requests[0]);
+        assert_eq!(response["result"]["rows"].as_array().unwrap().len(), cap);
+        assert_eq!(response["result"]["truncated"], true);
+        assert_eq!(response["result"]["total_count"], cap);
+    }
+
     fn read_request(stream: &mut impl Read) -> String {
         let mut request = Vec::new();
         let mut chunk = [0; 4096];

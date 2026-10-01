@@ -39,7 +39,7 @@ Harper documents can have different fields in every row. The plugin discovers th
 - Harper manages indexes per attribute. Tabularis displays them, but the Operations API does not support creating or dropping user-named, unique, or compound indexes through this driver.
 - Foreign keys, views, routines, and SQL `EXPLAIN` are not advertised because Harper does not expose matching enforced semantics through this driver.
 - `INTEGER`, `LONG`, and `ANY` primary keys created with auto increment are optional on insert so Harper can generate the key. Other primary-key types require a value.
-- Grid updates and deletes support non-empty string and numeric primary keys. Composite, object, array, boolean, null, and empty-string keys are rejected before a request is sent.
+- Grid updates and deletes support non-empty string and numeric primary keys. Composite, object, array, boolean, null, and empty-string keys are rejected before a request is sent, as are numeric keys outside JavaScript's safe integer range; use a string key for larger values.
 - When a connection does not select a database, metadata reads use the first configured database. Row edits and destructive DDL require an explicit database when more than one is available.
 
 ## TLS

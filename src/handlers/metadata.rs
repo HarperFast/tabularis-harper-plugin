@@ -375,17 +375,18 @@ fn string_value(value: &Value) -> Option<String> {
 pub(crate) fn primary_key(description: &Value) -> Option<String> {
     ["primary_key", "hash_attribute"]
         .into_iter()
-        .find_map(|field| description.get(field))
-        .and_then(|value| {
-            value
-                .as_str()
-                .or_else(|| value.get("attribute").and_then(Value::as_str))
-                .or_else(|| {
-                    value
-                        .as_array()
-                        .and_then(|values| values.first())
-                        .and_then(Value::as_str)
-                })
+        .find_map(|field| {
+            description.get(field).and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("attribute").and_then(Value::as_str))
+                    .or_else(|| {
+                        value
+                            .as_array()
+                            .and_then(|values| values.first())
+                            .and_then(Value::as_str)
+                    })
+            })
         })
         .map(str::to_string)
 }
@@ -411,9 +412,28 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        columns_from_description, database, database_names, indexes_from_description,
+        columns_from_description, database, database_names, indexes_from_description, primary_key,
         read_database, table_list,
     };
+
+    #[test]
+    fn falls_back_to_hash_attribute_when_primary_key_is_present_but_unusable() {
+        let description = json!({
+            "primary_key": null,
+            "hash_attribute": "id",
+            "attributes": [{ "attribute": "id" }, { "attribute": "name" }]
+        });
+
+        assert_eq!(primary_key(&description).as_deref(), Some("id"));
+        assert_eq!(
+            columns_from_description(description.clone()).unwrap()[0]["is_pk"],
+            json!(true)
+        );
+        assert_eq!(
+            indexes_from_description(description)[0]["name"],
+            json!("PRIMARY")
+        );
+    }
 
     #[test]
     fn uses_schema_as_database_for_tabularis_multi_database_requests() {

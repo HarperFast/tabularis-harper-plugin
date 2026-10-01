@@ -9,7 +9,7 @@ use crate::handlers::ddl;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{not_implemented, result_response};
 
-const MAX_UNBOUNDED_ROWS: u64 = 10_000;
+pub(crate) const MAX_UNBOUNDED_ROWS: u64 = 10_000;
 const MAX_PAGE_SIZE: u64 = MAX_UNBOUNDED_ROWS;
 const MAX_RESULT_COLUMNS: usize = 1_000;
 const MAX_PADDING_CELLS: usize = 1_000_000;
@@ -869,19 +869,5 @@ mod tests {
                 .contains("committed 1 record(s) and skipped 1")
         );
         assert!(write_query_result(json!({ "message": "ok" }), 0).is_err());
-    }
-
-    #[test]
-    fn unbounded_results_with_an_explicit_sql_limit_are_still_capped() {
-        let rows = (0..=MAX_UNBOUNDED_ROWS)
-            .map(|id| json!({ "id": id }))
-            .collect();
-        let result = unbounded_query_result(serde_json::Value::Array(rows), 3, true).unwrap();
-
-        assert_eq!(
-            result["rows"].as_array().unwrap().len(),
-            MAX_UNBOUNDED_ROWS as usize
-        );
-        assert_eq!(result["truncated"], true);
     }
 }
