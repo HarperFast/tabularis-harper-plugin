@@ -83,6 +83,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_defaults_missing_host_to_localhost() {
+        let (host, requests, server) = server_responses(vec![r#"{"username":"HDB_ADMIN"}"#]);
+        let port = host.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "test_connection",
+            "params": { "params": { "port": port } },
+            "id": 29
+        });
+
+        let response = handle_line(&request.to_string());
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+
+        assert_eq!(response["result"]["success"], true, "{response}");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(r#""operation":"user_info""#));
+    }
+
+    #[test]
     fn dispatch_executes_select_through_harper_http() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

@@ -422,7 +422,7 @@ fn build_endpoint(params: &ConnectionParams) -> Result<Url, PluginError> {
         .as_deref()
         .map(str::trim)
         .filter(|host| !host.is_empty())
-        .ok_or_else(|| PluginError::invalid_params("Harper host is required"))?;
+        .unwrap_or("localhost");
     let has_scheme = host.contains("://");
     let required_scheme = scheme_for(params.ssl_mode.as_deref())?;
     let inferred_scheme = if tls_mode_is_unset(params) && is_localhost_authority(host) {
@@ -833,6 +833,19 @@ mod tests {
 
         let explicit_http = build_endpoint(&params("http://example.com", None, None)).unwrap();
         assert_eq!(explicit_http.as_str(), "http://example.com/");
+    }
+
+    #[test]
+    fn empty_hosts_default_to_localhost() {
+        for host in [None, Some(String::new()), Some("   ".to_string())] {
+            let endpoint = build_endpoint(&ConnectionParams {
+                host,
+                ..ConnectionParams::default()
+            })
+            .unwrap();
+
+            assert_eq!(endpoint.as_str(), "http://localhost:9925/");
+        }
     }
 
     #[test]
