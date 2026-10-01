@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://www.harper.fast/">
-    <img src="./harper.png" alt="Harper" width="144">
+    <img src="https://raw.githubusercontent.com/HarperFast/tabularis-harper-plugin/main/harper.png" alt="Harper" width="144">
   </a>
 </p>
 
