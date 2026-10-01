@@ -53,8 +53,8 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         return result;
     }
     let mut query = normalized_statement(query)?;
-    quote_tabularis_count_alias(&mut query);
     normalize_tabularis_multiline_select(&mut query);
+    quote_tabularis_count_alias(&mut query);
     let kind = statement_kind(&query).ok_or_else(|| {
         PluginError::invalid_params(
             "the Harper driver accepts one SELECT, INSERT, UPDATE, or DELETE statement at a time",
@@ -104,7 +104,7 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
 }
 
 fn quote_tabularis_count_alias(query: &mut String) {
-    // Harper rejects the unquoted `count` alias emitted by Tabularis; DESIGN.md owns removal.
+    // Harper rejects the unquoted `count` alias emitted by Tabularis.
     if query.starts_with(TABULARIS_COUNT_QUERY_PREFIX) {
         query.replace_range(
             ..TABULARIS_COUNT_QUERY_PREFIX.len(),
@@ -114,7 +114,7 @@ fn quote_tabularis_count_alias(query: &mut String) {
 }
 
 fn normalize_tabularis_multiline_select(query: &mut String) {
-    // Harper classifies statements by the first space-delimited word; DESIGN.md owns removal.
+    // Harper classifies statements by the first space-delimited word.
     if query.starts_with(TABULARIS_MULTILINE_SELECT_PREFIX) {
         query.replace_range(
             ..TABULARIS_MULTILINE_SELECT_PREFIX.len(),
@@ -749,9 +749,12 @@ mod tests {
         }
 
         let mut count_interaction = "SELECT\nCOUNT(*) as count FROM data.File".to_string();
-        quote_tabularis_count_alias(&mut count_interaction);
         normalize_tabularis_multiline_select(&mut count_interaction);
-        assert_eq!(count_interaction, "SELECT COUNT(*) as count FROM data.File");
+        quote_tabularis_count_alias(&mut count_interaction);
+        assert_eq!(
+            count_interaction,
+            "SELECT COUNT(*) as `count` FROM data.File"
+        );
     }
 
     #[test]
