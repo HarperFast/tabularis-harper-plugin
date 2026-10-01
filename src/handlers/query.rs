@@ -101,8 +101,7 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
 }
 
 fn quote_tabularis_count_alias(query: &mut String) {
-    // Compatibility with Tabularis createCountRequest. Remove once the minimum supported
-    // Tabularis release quotes its generated `count` alias.
+    // Harper rejects the unquoted `count` alias emitted by Tabularis; DESIGN.md owns removal.
     if query.starts_with(TABULARIS_COUNT_QUERY_PREFIX) {
         query.replace_range(
             ..TABULARIS_COUNT_QUERY_PREFIX.len(),
