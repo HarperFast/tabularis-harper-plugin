@@ -341,6 +341,8 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
     let mut word = String::new();
     let mut word_is_qualified = false;
     let mut last_code_character = None;
+    let mut last_dot_qualifies = false;
+    let mut last_word_starts_identifier = false;
     let mut chars = query.char_indices().peekable();
 
     while let Some((index, character)) = chars.next() {
@@ -418,9 +420,16 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                 }
 
                 let previous_code_character = last_code_character;
+                let previous_dot_qualifies = last_dot_qualifies;
                 if !character.is_whitespace() {
                     last_code_index = Some(index);
                     last_code_character = Some(character);
+                    last_dot_qualifies = character == '.'
+                        && last_word_starts_identifier
+                        && previous_code_character.is_some_and(|character| {
+                            character.is_ascii_alphanumeric()
+                                || matches!(character, '_' | '"' | '`' | '[')
+                        });
                 }
                 match character {
                     '\'' | '"' | '`' => {
@@ -431,6 +440,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             &mut top_level_select_clause,
                             &mut word_is_qualified,
                         );
+                        last_word_starts_identifier = character != '\'';
                         state = ScanState::Quoted(character);
                     }
                     '[' => {
@@ -441,6 +451,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             &mut top_level_select_clause,
                             &mut word_is_qualified,
                         );
+                        last_word_starts_identifier = true;
                         state = ScanState::Bracketed;
                     }
                     ';' => {
@@ -472,7 +483,10 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             && (character.is_ascii_alphanumeric() || character == '_') =>
                     {
                         if word.is_empty() {
-                            word_is_qualified = previous_code_character == Some('.');
+                            word_is_qualified =
+                                previous_code_character == Some('.') && previous_dot_qualifies;
+                            last_word_starts_identifier =
+                                character.is_ascii_alphabetic() || character == '_';
                         }
                         word.push(character);
                     }
@@ -954,6 +968,7 @@ mod tests {
             "SELECT a.id FROM data.a a INNER JOIN data.b b ON a.id = b.id, data.c c",
             "SELECT\n  a.id\nFROM\n  data.a a\nINNER JOIN data.b b ON a.id = b.id,\n  data.c c",
             "SELECT id FROM data.a UNION SELECT id FROM data.b, data.c",
+            "SELECT 1. FROM data.a a, data.b b",
         ] {
             assert!(scan_sql(query).unwrap().has_top_level_from_comma, "{query}");
         }
