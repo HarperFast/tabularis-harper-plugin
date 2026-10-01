@@ -84,7 +84,8 @@ mod tests {
 
     #[test]
     fn dispatch_defaults_missing_host_to_localhost() {
-        let (host, requests, server) = server_responses(vec![r#"{"username":"HDB_ADMIN"}"#]);
+        let (host, requests, server) =
+            server_responses_on("localhost:0", vec![r#"{"username":"HDB_ADMIN"}"#]);
         let port = host.rsplit(':').next().unwrap().parse::<u16>().unwrap();
         let request = json!({
             "jsonrpc": "2.0",
@@ -801,7 +802,14 @@ mod tests {
     fn server_responses(
         responses: Vec<&'static str>,
     ) -> (String, Receiver<Vec<String>>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        server_responses_on("127.0.0.1:0", responses)
+    }
+
+    fn server_responses_on(
+        bind_address: &str,
+        responses: Vec<&'static str>,
+    ) -> (String, Receiver<Vec<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(bind_address).unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
         let server = thread::spawn(move || {
