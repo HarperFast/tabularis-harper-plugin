@@ -339,6 +339,8 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
     let mut top_level_select_clause = TopLevelSelectClause::BeforeSelect;
     let mut has_top_level_from_comma = false;
     let mut word = String::new();
+    let mut word_is_qualified = false;
+    let mut last_code_character = None;
     let mut chars = query.char_indices().peekable();
 
     while let Some((index, character)) = chars.next() {
@@ -396,6 +398,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                         depth,
                         &mut top_level_keywords,
                         &mut top_level_select_clause,
+                        &mut word_is_qualified,
                     );
                     chars.next();
                     state = ScanState::LineComment;
@@ -407,14 +410,17 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                         depth,
                         &mut top_level_keywords,
                         &mut top_level_select_clause,
+                        &mut word_is_qualified,
                     );
                     chars.next();
                     state = ScanState::BlockComment;
                     continue;
                 }
 
+                let previous_code_character = last_code_character;
                 if !character.is_whitespace() {
                     last_code_index = Some(index);
+                    last_code_character = Some(character);
                 }
                 match character {
                     '\'' | '"' | '`' => {
@@ -423,6 +429,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             depth,
                             &mut top_level_keywords,
                             &mut top_level_select_clause,
+                            &mut word_is_qualified,
                         );
                         state = ScanState::Quoted(character);
                     }
@@ -432,6 +439,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             depth,
                             &mut top_level_keywords,
                             &mut top_level_select_clause,
+                            &mut word_is_qualified,
                         );
                         state = ScanState::Bracketed;
                     }
@@ -441,6 +449,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             depth,
                             &mut top_level_keywords,
                             &mut top_level_select_clause,
+                            &mut word_is_qualified,
                         );
                         semicolons.push(index);
                     }
@@ -450,6 +459,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             depth,
                             &mut top_level_keywords,
                             &mut top_level_select_clause,
+                            &mut word_is_qualified,
                         );
                         depth = depth.saturating_add(1);
                     }
@@ -461,6 +471,9 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                         if depth == 0
                             && (character.is_ascii_alphanumeric() || character == '_') =>
                     {
+                        if word.is_empty() {
+                            word_is_qualified = previous_code_character == Some('.');
+                        }
                         word.push(character);
                     }
                     ',' => {
@@ -469,6 +482,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                             depth,
                             &mut top_level_keywords,
                             &mut top_level_select_clause,
+                            &mut word_is_qualified,
                         );
                         if depth == 0 && top_level_select_clause == TopLevelSelectClause::From {
                             has_top_level_from_comma = true;
@@ -479,6 +493,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                         depth,
                         &mut top_level_keywords,
                         &mut top_level_select_clause,
+                        &mut word_is_qualified,
                     ),
                 }
             }
@@ -489,6 +504,7 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
         depth,
         &mut top_level_keywords,
         &mut top_level_select_clause,
+        &mut word_is_qualified,
     );
 
     match state {
@@ -507,13 +523,17 @@ fn finish_word(
     depth: u32,
     keywords: &mut Vec<String>,
     select_clause: &mut TopLevelSelectClause,
+    word_is_qualified: &mut bool,
 ) {
     if depth == 0 && !word.is_empty() {
-        update_top_level_select_clause(select_clause, word);
+        if !*word_is_qualified {
+            update_top_level_select_clause(select_clause, word);
+        }
         keywords.push(std::mem::take(word));
     } else {
         word.clear();
     }
+    *word_is_qualified = false;
 }
 
 fn update_top_level_select_clause(clause: &mut TopLevelSelectClause, word: &str) {
@@ -533,7 +553,7 @@ fn update_top_level_select_clause(clause: &mut TopLevelSelectClause, word: &str)
         *clause = TopLevelSelectClause::SetOperation;
     } else if *clause == TopLevelSelectClause::From
         && [
-            "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
+            "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "WINDOW", "FOR",
         ]
         .into_iter()
         .any(|keyword| word.eq_ignore_ascii_case(keyword))
@@ -932,6 +952,7 @@ mod tests {
             "SELECT a.id, b.id FROM data.a a, data.b b WHERE a.id = b.id",
             "select a.id, b.id from data.a a, data.b b",
             "SELECT a.id FROM data.a a INNER JOIN data.b b ON a.id = b.id, data.c c",
+            "SELECT\n  a.id\nFROM\n  data.a a\nINNER JOIN data.b b ON a.id = b.id,\n  data.c c",
             "SELECT id FROM data.a UNION SELECT id FROM data.b, data.c",
         ] {
             assert!(scan_sql(query).unwrap().has_top_level_from_comma, "{query}");
@@ -950,6 +971,10 @@ mod tests {
             "SELECT a FROM data.a GROUP BY a HAVING COUNT(*) IN (1, 2)",
             "SELECT * FROM data.a ORDER BY a, b",
             "SELECT * FROM data.a LIMIT 10, 20",
+            "SELECT m.from, m.subject FROM data.messages m",
+            "SELECT m . /* qualified */ from, m.subject FROM data.messages m",
+            "SELECT * FROM data.a WINDOW w1 AS (), w2 AS ()",
+            "SELECT * FROM data.a FOR UPDATE OF a, b",
             "SELECT * FROM data.a a INNER JOIN data.b b USING (id, tenant_id)",
             "DELETE FROM data.a WHERE id IN (1, 2)",
         ] {
