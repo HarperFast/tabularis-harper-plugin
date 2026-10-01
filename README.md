@@ -40,9 +40,9 @@ Adding a column is limited to `ANY` because Harper's `create_attribute` operatio
 
 Install **Harper** from **Settings → Available Plugins** in Tabularis. If it is not yet listed in your Tabularis version, or you prefer a manual installation, download a bundle from this repository's [Releases page](../../releases/latest).
 
-To connect, provide the Harper port, username, and password. Leave the host empty to use `localhost`; port `9925` is the default. Selecting a database is optional for browsing. When a connection exposes more than one database, choose one explicitly before editing rows or running destructive DDL.
+To connect, provide the Harper host, port, username, and password. An empty host defaults to `localhost`, and port `9925` is the default. Selecting a database is optional for browsing. When a connection exposes more than one database, choose one explicitly before editing rows or running destructive DDL.
 
-For a local Harper instance using plain HTTP, enter `localhost` (or an explicit `http://` host) and leave SSL mode unset, or set SSL mode to **Disabled**. **Preferred**, **Required**, and verification modes always use HTTPS. Only disable TLS on a trusted network because Harper credentials are sent with the request.
+For a local Harper instance using plain HTTP, leave the host empty (or enter `localhost` or an explicit `http://` host) and leave SSL mode unset, or set SSL mode to **Disabled**. **Preferred**, **Required**, and verification modes always use HTTPS. Only disable TLS on a trusted network because Harper credentials are sent with the request.
 
 ## Querying
 
