@@ -14,6 +14,8 @@ const MAX_PAGE_SIZE: u64 = MAX_UNBOUNDED_ROWS;
 const MAX_RESULT_COLUMNS: usize = 1_000;
 const MAX_PADDING_CELLS: usize = 1_000_000;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const TABULARIS_COUNT_QUERY_PREFIX: &str = "SELECT COUNT(*) as count FROM ";
+const HARPER_COUNT_QUERY_PREFIX: &str = "SELECT COUNT(*) as `count` FROM ";
 
 pub fn test_connection(id: Value, params: &Value) -> Value {
     let result = client_with_timeout(params, PROBE_TIMEOUT)
@@ -48,7 +50,8 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
     if let Some(result) = ddl::execute_ddl(params, query) {
         return result;
     }
-    let query = normalized_statement(query)?;
+    let mut query = normalized_statement(query)?;
+    quote_tabularis_count_alias(&mut query);
     let kind = statement_kind(&query).ok_or_else(|| {
         PluginError::invalid_params(
             "the Harper driver accepts one SELECT, INSERT, UPDATE, or DELETE statement at a time",
@@ -94,6 +97,17 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
     match page_size {
         Some(page_size) => tabularis_query_result(response, page, page_size, elapsed, server_paged),
         None => unbounded_query_result(response, elapsed, true),
+    }
+}
+
+fn quote_tabularis_count_alias(query: &mut String) {
+    // Compatibility with Tabularis createCountRequest. Remove once the minimum supported
+    // Tabularis release quotes its generated `count` alias.
+    if query.starts_with(TABULARIS_COUNT_QUERY_PREFIX) {
+        query.replace_range(
+            ..TABULARIS_COUNT_QUERY_PREFIX.len(),
+            HARPER_COUNT_QUERY_PREFIX,
+        );
     }
 }
 
@@ -635,10 +649,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        bounded_shape, contains_top_level_keyword, normalized_statement, requested_page_size,
-        require_qualified_write_target, statement_kind, tabularis_query_result,
-        unbounded_query_result, write_query_result, MAX_PADDING_CELLS, MAX_RESULT_COLUMNS,
-        MAX_UNBOUNDED_ROWS,
+        bounded_shape, contains_top_level_keyword, normalized_statement,
+        quote_tabularis_count_alias, requested_page_size, require_qualified_write_target,
+        statement_kind, tabularis_query_result, unbounded_query_result, write_query_result,
+        MAX_PADDING_CELLS, MAX_RESULT_COLUMNS, MAX_UNBOUNDED_ROWS,
     };
 
     #[test]
@@ -682,6 +696,24 @@ mod tests {
             Some("SELECT")
         );
         assert_eq!(statement_kind("CREATE TABLE dog (id INT)"), None);
+    }
+
+    #[test]
+    fn count_alias_compatibility_only_rewrites_tabularis_generated_sql() {
+        let mut generated = "SELECT COUNT(*) as count FROM `data`.`File`".to_string();
+        quote_tabularis_count_alias(&mut generated);
+        assert_eq!(generated, "SELECT COUNT(*) as `count` FROM `data`.`File`");
+
+        for query in [
+            "SELECT COUNT(*) AS count FROM `data`.`File`",
+            "SELECT COUNT(*) as `count` FROM `data`.`File`",
+            "/* count */ SELECT COUNT(*) as count FROM `data`.`File`",
+            "SELECT COUNT(*) as counter FROM `data`.`File`",
+        ] {
+            let mut unchanged = query.to_string();
+            quote_tabularis_count_alias(&mut unchanged);
+            assert_eq!(unchanged, query);
+        }
     }
 
     #[test]

@@ -140,6 +140,36 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_quotes_the_count_alias_generated_by_tabularis() {
+        let (host, requests, server) = server_responses(vec![r#"[{"count":42}]"#]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host },
+                    "query": "SELECT COUNT(*) as count FROM `data`.`File`",
+                    "page": 1,
+                    "limit": 100
+                },
+                "id": 32
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+        let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let operation: Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(
+            operation["sql"],
+            "SELECT COUNT(*) as `count` FROM `data`.`File`\nLIMIT 101 OFFSET 0"
+        );
+        assert_eq!(response["result"]["columns"], json!(["count"]));
+        assert_eq!(response["result"]["rows"], json!([[42]]));
+    }
+
+    #[test]
     fn dispatch_caps_unbounded_queries_without_tabularis_pagination() {
         let (host, requests, server) = server_responses(vec![r#"[{"id":1}]"#]);
         let response = handle_line(
