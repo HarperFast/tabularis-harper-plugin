@@ -95,10 +95,10 @@ mod tests {
         });
 
         let response = handle_line(&request.to_string());
+        assert_eq!(response["result"]["success"], true, "{response}");
         server.join().unwrap();
         let requests = requests.recv().unwrap();
 
-        assert_eq!(response["result"]["success"], true, "{response}");
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains(r#""operation":"user_info""#));
     }
