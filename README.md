@@ -26,7 +26,7 @@ This plugin focuses on the database administration and ad-hoc querying experienc
 - Run one Harper SQL `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement at a time.
 - Insert, update, and delete records directly from the grid.
 - Create and drop tables.
-- Add attributes to dynamic tables and remove attributes when Harper can safely remove their stored values.
+- Add untyped (`ANY`) attributes to any table and remove attributes from dynamic tables.
 - Connect over HTTP for trusted local development or HTTPS with publicly trusted certificates.
 - Work with Harper v4 and v5 metadata shapes.
 
@@ -34,15 +34,15 @@ This plugin focuses on the database administration and ad-hoc querying experienc
 
 Tabularis can display Harper indexes, but it cannot create or drop named, unique, or compound indexes through this plugin. Views, foreign keys, routines, SQL `EXPLAIN`, full column alterations, custom certificate authorities, and client certificates are not currently exposed.
 
-Harper schema-defined tables have additional safeguards: adding a column is limited to `ANY`, and dropping a declared attribute is rejected when Harper would retain its stored values. Grid updates and deletes require a supported scalar primary key. See [Capabilities and limitations](docs/capabilities.md) for the complete compatibility notes.
+Adding a column is limited to `ANY` because Harper's `create_attribute` operation does not accept a type. Dropping a declared attribute from a schema-defined table is rejected when Harper would retain its stored values. Grid updates and deletes require a supported scalar primary key. See [Capabilities and limitations](docs/capabilities.md) for the complete compatibility notes.
 
 ## Install
 
-Install **Harper** from **Settings → Available Plugins** in Tabularis. Plugin releases are also available from this repository's [Releases page](../../releases/latest).
+Install **Harper** from **Settings → Available Plugins** in Tabularis. If it is not yet listed in your Tabularis version, or you prefer a manual installation, download a bundle from this repository's [Releases page](../../releases/latest).
 
-To connect, provide the Harper host, port, username, and password. Port `9925` is the default. Selecting a database is optional for browsing; choosing one explicitly is recommended before making schema or data changes.
+To connect, provide the Harper host, port, username, and password. Port `9925` is the default. Selecting a database is optional for browsing. When a connection exposes more than one database, choose one explicitly before editing rows or running destructive DDL.
 
-For a local Harper instance using plain HTTP, use an explicit `http://localhost` host or set SSL mode to **Disabled**. Only disable TLS on a trusted network because Harper credentials are sent with the request.
+For a local Harper instance using plain HTTP, enter `localhost` (or an explicit `http://` host) and leave SSL mode unset, or set SSL mode to **Disabled**. **Preferred**, **Required**, and verification modes always use HTTPS. Only disable TLS on a trusted network because Harper credentials are sent with the request.
 
 ## Querying
 

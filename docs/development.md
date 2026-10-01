@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- A current Rust toolchain
+- The Rust toolchain pinned in `rust-toolchain.toml` (currently 1.98.1)
 - [`just`](https://github.com/casey/just)
 - Tabularis for testing the installed plugin
 - A reachable Harper instance for integration testing

@@ -6,7 +6,7 @@ This document describes how the Harper driver maps Tabularis features to Harper'
 
 | Method or feature | Status | Notes |
 |---|---|---|
-| `test_connection` | Supported | Authenticates with `describe_all`, so invalid credentials fail the connection test. |
+| `test_connection` | Supported | Authenticates with `user_info`, so invalid credentials fail the connection test. |
 | `ping` | Supported | Uses Harper's lightweight `/health` endpoint. |
 | `get_databases`, `get_tables`, `get_columns`, `get_indexes` | Supported | Uses Harper describe operations and accepts v4 `hash_attribute` and v5 `primary_key` metadata. |
 | `get_schemas`, `get_foreign_keys` | Empty by design | Harper databases appear as databases in Tabularis, and the driver does not expose foreign keys. |
