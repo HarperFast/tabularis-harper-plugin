@@ -1,107 +1,75 @@
-# Harper — Tabularis Plugin
+<p align="center">
+  <a href="https://www.harper.fast/">
+    <img src="./harper.png" alt="Harper" width="144">
+  </a>
+</p>
 
-Harper plugin for [Tabularis](https://github.com/TabularisDB/tabularis).
-Generated with `@tabularis/create-plugin`.
+<h1 align="center">Harper for Tabularis</h1>
 
-## Getting started
+<p align="center">
+  Explore, query, and edit <a href="https://www.harper.fast/">Harper</a> data from
+  <a href="https://github.com/TabularisDB/tabularis">Tabularis</a>.
+</p>
 
-```bash
-just dev-install       # build + install into ~/.local/share/tabularis/plugins/drivers/harper
+This driver connects Tabularis to a Harper instance through Harper's HTTP Operations API. It brings Harper databases and tables into the Tabularis explorer while preserving Harper's flexible document model.
+
+## Why Harper?
+
+Harper is an all-in-one backend that combines a database, caching, application hosting, and messaging in a single runtime. Its database provides ACID-compliant storage, flexible schemas, automatic and explicit indexing, and access to the same data through several interfaces—including SQL, REST, and Harper applications.
+
+This plugin focuses on the database administration and ad-hoc querying experience. It does not attempt to configure Harper applications, REST resources, messaging, replication, or AI models from Tabularis.
+
+## Features
+
+- Browse Harper databases, tables, attributes, primary keys, and per-attribute indexes.
+- Inspect heterogeneous documents in Tabularis's data grid, even when records have different fields.
+- Run one Harper SQL `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement at a time.
+- Insert, update, and delete records directly from the grid.
+- Create and drop tables.
+- Add attributes to dynamic tables and remove attributes when Harper can safely remove their stored values.
+- Connect over HTTP for trusted local development or HTTPS with publicly trusted certificates.
+- Work with Harper v4 and v5 metadata shapes.
+
+## Current boundaries
+
+Tabularis can display Harper indexes, but it cannot create or drop named, unique, or compound indexes through this plugin. Views, foreign keys, routines, SQL `EXPLAIN`, full column alterations, custom certificate authorities, and client certificates are not currently exposed.
+
+Harper schema-defined tables have additional safeguards: adding a column is limited to `ANY`, and dropping a declared attribute is rejected when Harper would retain its stored values. Grid updates and deletes require a supported scalar primary key. See [Capabilities and limitations](docs/capabilities.md) for the complete compatibility notes.
+
+## Install
+
+Install **Harper** from **Settings → Available Plugins** in Tabularis. Plugin releases are also available from this repository's [Releases page](../../releases/latest).
+
+To connect, provide the Harper host, port, username, and password. Port `9925` is the default. Selecting a database is optional for browsing; choosing one explicitly is recommended before making schema or data changes.
+
+For a local Harper instance using plain HTTP, use an explicit `http://localhost` host or set SSL mode to **Disabled**. Only disable TLS on a trusted network because Harper credentials are sent with the request.
+
+## Querying
+
+Harper SQL uses `database.table` names. Quote identifiers with backticks when they contain special characters or collide with a reserved word:
+
+```sql
+SELECT *
+FROM `data`.`animal`
+ORDER BY `name`
+LIMIT 100;
 ```
 
-Then open Tabularis — the Harper driver appears in the connection picker.
+Write queries must always qualify the target with its database so the plugin cannot apply a change to an unintended database.
 
-## What's implemented
+Harper recommends SQL for investigation and administration rather than performance-sensitive production access. Applications should use Harper's native application, REST, or NoSQL interfaces where appropriate.
 
-| Method | Status | Notes |
-|--------|--------|-------|
-| `test_connection` | implemented | authenticates with `describe_all` so invalid credentials fail |
-| `ping` | implemented | uses Harper's lightweight `/health` endpoint |
-| `get_databases`, `get_tables`, `get_columns`, `get_indexes` | implemented | uses Harper describe operations; supports v4 `hash_attribute` and v5 `primary_key` metadata |
-| `get_schemas`, `get_foreign_keys` | implemented | return `[]`; Harper databases are selected as databases and the driver does not expose foreign keys |
-| `get_views*`, `get_routines*` | stub | return empty results while their capabilities remain disabled |
-| `create_view`, `alter_view`, `drop_view` | `-32601` | not implemented — flip `capabilities.views` once these are wired |
-| `execute_query` | implemented | accepts one `SELECT`, `INSERT`, `UPDATE`, or `DELETE`; supported Tabularis DDL is translated to native Harper operations |
-| `explain_query` | `-32601` | Harper does not currently expose an explain operation through this driver |
-| `insert_record`, `update_record`, `delete_record` | implemented | uses native Harper operations; update/delete verify the table's real primary key first |
-| Create/drop table, add/drop attribute | implemented | maps Tabularis SQL previews to Harper schema operations |
-| Alter attribute, named index mutation, foreign keys | unsupported | Harper has no atomic Operations API equivalent; the plugin returns a precise error instead of approximating the mutation |
-| Schema snapshot and batch metadata methods | implemented | loads a database description once and returns Tabularis's current metadata shapes |
+## How it works
 
-## Layout
+Tabularis starts the `harper` executable and communicates with it over JSON-RPC on standard input and output. The plugin translates those requests into authenticated HTTP calls to Harper's Operations API; no separate Rust SDK is required.
 
-```
-src/
-├── lib.rs             shared stdio loop + production dispatch entry points
-├── main.rs            thin executable wrapper
-├── rpc.rs             method dispatch + response helpers
-├── error.rs           plugin error type
-├── models.rs          ConnectionParams + common shapes
-├── client.rs          Harper Operations API transport, auth and errors
-├── handlers/
-│   ├── metadata.rs    databases, schemas, tables, columns, indexes, FKs, views, routines
-│   ├── query.rs       test_connection, ping, execute_query, explain_query
-│   ├── crud.rs        insert_record, update_record, delete_record
-│   └── ddl.rs         CREATE/ALTER/DROP generators
-└── bin/
-    └── test_plugin.rs local REPL for simulating Tabularis calls
-```
+## Documentation
 
-HTTP, authentication and Operations API details stay in `client.rs`. Handlers only translate between Harper values and Tabularis JSON-RPC shapes; the low-level operation method is not exposed outside the client.
-
-## Testing without Tabularis
-
-```bash
-HARPER_HOST=http://localhost \
-HARPER_PORT=9925 \
-HARPER_DATABASE=data \
-HARPER_USERNAME=HDB_ADMIN \
-HARPER_PASSWORD=password \
-just repl
-
-# > test_connection
-# > get_databases
-# > get_tables
-# > query SELECT * FROM data.dog
-# > query UPDATE data.dog SET name = 'Rover' WHERE id = 1
-```
-
-The REPL also accepts a complete JSON-RPC request on one line. It calls the same production dispatch path as the shipped plugin; credentials are read from the environment and are not printed.
-
-Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results. Individual pages and Tabularis's **All** mode are limited to 10,000 rows; **All** sets `truncated: true` when more rows exist. The transport also enforces a 16 MiB response ceiling.
-
-SQL `INSERT`, `UPDATE`, and `DELETE` targets must be qualified as `database.table`. This prevents Harper from resolving an unqualified write against a different database than the active Tabularis context.
-
-Harper documents may have different fields in every row. The plugin discovers all fields on the visible page, but bounds the resulting rectangular grid to 1,000 columns and 1,000,000 empty padding cells. Paged queries return a precise error when that shape is too sparse; **All** mode returns the largest complete prefix and marks it truncated.
-
-## Harper-specific behavior
-
-- Table creation uses Harper's schema-defined attributes. Declared types and nullability are enforced by current Harper versions, and inserts do not create undeclared attributes automatically.
-- `VARCHAR` input maps to Harper's `String` type and is previewed as `TEXT`; Harper does not enforce a character-length limit for it.
-- Dropping an attribute is rejected for schema-defined tables because current Harper would retain the stored property values. Dynamic-table attribute drops remain available when Harper can purge the data.
-- Adding a column supports `ANY` only. Harper's `create_attribute` operation has no type/nullability/default input, so the plugin rejects typed additions rather than reporting a type it did not enforce.
-- Harper manages per-attribute indexes. They are shown accurately, but the Operations API does not support creating/dropping user-named, unique, or compound indexes.
-- Foreign keys, views, routines, and SQL EXPLAIN are not advertised because Harper does not expose matching enforced semantics through this driver.
-- INTEGER, LONG, and ANY primary keys created with auto increment are made omittable in Harper's schema so Harper can generate the key. Other primary-key types require an explicit value.
-- Grid updates and deletes support non-empty string and numeric primary keys. Composite, object, array, boolean, null, and empty-string keys are rejected before any request is sent.
-- When Tabularis omits a database selection, metadata reads use the first database configured on the connection. Row edits and destructive DDL require an explicit database when the connection lists more than one, preventing a write from being guessed into the wrong database.
-
-## TLS
-
-The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. A bare host defaults to HTTPS, except the local development name `localhost`, which defaults to HTTP. Loopback IP addresses still default to HTTPS because Tabularis also uses them for tunneled remote connections. Use an explicit `http://` URL or select Disabled for any other intentionally unencrypted connection, and only on a trusted network because Basic-auth credentials will be sent unencrypted. Preferred/required/verification modes force HTTPS, including on `localhost`, and an explicit `http://` host is rejected for those modes. Custom CA, client certificate, and client key files are rejected until the plugin can apply them to its Rust TLS client; they are never silently ignored, so self-signed HTTPS endpoints require a publicly trusted certificate for now.
-
-## Publishing
-
-After CI passes, tag the commit `v0.1.0` and push the tag. The tag without its `v` prefix must match the version in `.tabularium`. The included GitHub Actions workflow builds for Linux (x64/arm64), macOS (x64/arm64), and Windows (x64), then attaches the zipped plugin bundles and standalone manifest to the release.
-
-Submit the released plugin through [registry.tabularis.dev/submit](https://registry.tabularis.dev/submit) to publish it to the in-app registry.
-
-## References
-
-- [Plugin guide](https://github.com/TabularisDB/tabularis/blob/main/plugins/PLUGIN_GUIDE.md)
-- [Manifest schema](https://github.com/TabularisDB/tabularis/blob/main/plugins/manifest.schema.json)
-- [Tabularis repo](https://github.com/TabularisDB/tabularis)
+- [Capabilities and limitations](docs/capabilities.md)
+- [Development and local installation](docs/development.md)
+- [Harper documentation](https://docs.harperdb.io/)
+- [Tabularis plugin registry](https://registry.tabularis.dev/plugins)
 
 ## License
 
-Apache-2.0
+Licensed under the [Apache License 2.0](LICENSE).
