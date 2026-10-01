@@ -170,6 +170,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_normalizes_the_multiline_select_generated_by_tabularis() {
+        let (host, requests, server) =
+            server_responses(vec![r#"[{"file_id":"file-1","package_id":"package-1"}]"#]);
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": host },
+                    "query": "SELECT\n  t1.`id` AS `file_id`,\n  t2.`id` AS `package_id`\nFROM\n  `data`.`File` t1\nINNER JOIN `packages`.`Package` t2 ON t1.`id` = t2.`id`",
+                    "page": 2,
+                    "limit": 2
+                },
+                "id": 33
+            })
+            .to_string(),
+        );
+        server.join().unwrap();
+        let requests = requests.recv().unwrap();
+        let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let operation: Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(
+            operation["sql"],
+            "SELECT   t1.`id` AS `file_id`,\n  t2.`id` AS `package_id`\nFROM\n  `data`.`File` t1\nINNER JOIN `packages`.`Package` t2 ON t1.`id` = t2.`id`\nLIMIT 3 OFFSET 2"
+        );
+        assert_eq!(
+            response["result"]["columns"],
+            json!(["file_id", "package_id"])
+        );
+        assert_eq!(response["result"]["rows"], json!([["file-1", "package-1"]]));
+    }
+
+    #[test]
     fn dispatch_caps_unbounded_queries_without_tabularis_pagination() {
         let (host, requests, server) = server_responses(vec![r#"[{"id":1}]"#]);
         let response = handle_line(

@@ -16,6 +16,8 @@ const MAX_PADDING_CELLS: usize = 1_000_000;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const TABULARIS_COUNT_QUERY_PREFIX: &str = "SELECT COUNT(*) as count FROM ";
 const HARPER_COUNT_QUERY_PREFIX: &str = "SELECT COUNT(*) as `count` FROM ";
+const TABULARIS_MULTILINE_SELECT_PREFIX: &str = "SELECT\n";
+const HARPER_SELECT_PREFIX: &str = "SELECT ";
 
 pub fn test_connection(id: Value, params: &Value) -> Value {
     let result = client_with_timeout(params, PROBE_TIMEOUT)
@@ -52,6 +54,7 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
     }
     let mut query = normalized_statement(query)?;
     quote_tabularis_count_alias(&mut query);
+    normalize_tabularis_multiline_select(&mut query);
     let kind = statement_kind(&query).ok_or_else(|| {
         PluginError::invalid_params(
             "the Harper driver accepts one SELECT, INSERT, UPDATE, or DELETE statement at a time",
@@ -106,6 +109,16 @@ fn quote_tabularis_count_alias(query: &mut String) {
         query.replace_range(
             ..TABULARIS_COUNT_QUERY_PREFIX.len(),
             HARPER_COUNT_QUERY_PREFIX,
+        );
+    }
+}
+
+fn normalize_tabularis_multiline_select(query: &mut String) {
+    // Harper classifies statements by the first space-delimited word; DESIGN.md owns removal.
+    if query.starts_with(TABULARIS_MULTILINE_SELECT_PREFIX) {
+        query.replace_range(
+            ..TABULARIS_MULTILINE_SELECT_PREFIX.len(),
+            HARPER_SELECT_PREFIX,
         );
     }
 }
@@ -648,10 +661,11 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        bounded_shape, contains_top_level_keyword, normalized_statement,
-        quote_tabularis_count_alias, requested_page_size, require_qualified_write_target,
-        statement_kind, tabularis_query_result, unbounded_query_result, write_query_result,
-        MAX_PADDING_CELLS, MAX_RESULT_COLUMNS, MAX_UNBOUNDED_ROWS,
+        bounded_shape, contains_top_level_keyword, normalize_tabularis_multiline_select,
+        normalized_statement, quote_tabularis_count_alias, requested_page_size,
+        require_qualified_write_target, statement_kind, tabularis_query_result,
+        unbounded_query_result, write_query_result, MAX_PADDING_CELLS, MAX_RESULT_COLUMNS,
+        MAX_UNBOUNDED_ROWS,
     };
 
     #[test]
@@ -713,6 +727,31 @@ mod tests {
             quote_tabularis_count_alias(&mut unchanged);
             assert_eq!(unchanged, query);
         }
+    }
+
+    #[test]
+    fn multiline_select_compatibility_only_rewrites_tabularis_generated_prefix() {
+        let mut generated = "SELECT\n  t1.id\nFROM\n  data.File t1".to_string();
+        normalize_tabularis_multiline_select(&mut generated);
+        assert_eq!(generated, "SELECT   t1.id\nFROM\n  data.File t1");
+
+        for query in [
+            "SELECT * FROM data.File",
+            "select\n  *\nFROM data.File",
+            "SELECT\r\n  *\r\nFROM data.File",
+            "/* visual */ SELECT\n  *\nFROM data.File",
+            "(SELECT\n  *\nFROM data.File)",
+            "SELECT 'SELECT\n' AS value FROM data.File",
+        ] {
+            let mut unchanged = query.to_string();
+            normalize_tabularis_multiline_select(&mut unchanged);
+            assert_eq!(unchanged, query);
+        }
+
+        let mut count_interaction = "SELECT\nCOUNT(*) as count FROM data.File".to_string();
+        quote_tabularis_count_alias(&mut count_interaction);
+        normalize_tabularis_multiline_select(&mut count_interaction);
+        assert_eq!(count_interaction, "SELECT COUNT(*) as count FROM data.File");
     }
 
     #[test]
