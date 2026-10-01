@@ -204,6 +204,30 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_explains_unjoined_visual_query_tables_before_http() {
+        let response = handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "execute_query",
+                "params": {
+                    "params": { "host": "http://127.0.0.1:1" },
+                    "query": "SELECT\n  t1.`path`,\n  t2.`filename`\nFROM\n  `packages`.`registry` t1,\n  `data`.`File` t2",
+                    "page": 1,
+                    "limit": 500
+                },
+                "id": 34
+            })
+            .to_string(),
+        );
+
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert_eq!(
+            response["error"]["message"],
+            "Harper cannot execute comma-separated tables in FROM. Join each table using JOIN ... ON matching columns; in the visual query builder, connect every table node."
+        );
+    }
+
+    #[test]
     fn dispatch_caps_unbounded_queries_without_tabularis_pagination() {
         let (host, requests, server) = server_responses(vec![r#"[{"id":1}]"#]);
         let response = handle_line(

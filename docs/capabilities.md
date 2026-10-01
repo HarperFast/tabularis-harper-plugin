@@ -24,6 +24,8 @@ This document describes how the Harper driver maps Tabularis features to Harper'
 
 SQL `INSERT`, `UPDATE`, and `DELETE` targets must be qualified as `database.table`. This prevents Harper from resolving an unqualified write against a different database from the active Tabularis context.
 
+Every table in a multi-table query must be connected with `JOIN ... ON` matching columns. Harper does not execute the comma-separated `FROM` list that Tabularis generates for disconnected visual-query nodes, so the plugin rejects it with an actionable error before sending the query.
+
 Queries without their own top-level `LIMIT` are fetched from Harper one page at a time. `total_count` is a monotonic lower bound until the final page because Harper SQL does not expose an efficient count alongside arbitrary query results.
 
 Individual pages and Tabularis's **All** mode are limited to 10,000 rows. **All** sets `truncated: true` when more rows exist. The HTTP transport also enforces a 16 MiB response ceiling.

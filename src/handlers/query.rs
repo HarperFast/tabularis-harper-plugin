@@ -55,7 +55,10 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
     let mut query = normalized_statement(query)?;
     normalize_tabularis_multiline_select(&mut query);
     quote_tabularis_count_alias(&mut query);
-    let kind = statement_kind(&query).ok_or_else(|| {
+    let scan = scan_sql(&query).ok_or_else(|| {
+        PluginError::invalid_params("SQL contains an unterminated comment or quote")
+    })?;
+    let kind = scan.statement_kind().ok_or_else(|| {
         PluginError::invalid_params(
             "the Harper driver accepts one SELECT, INSERT, UPDATE, or DELETE statement at a time",
         )
@@ -68,12 +71,16 @@ fn execute_query_inner(params: &Value) -> Result<Value, PluginError> {
         .max(1);
     let page_size = requested_page_size(params);
     let is_select = kind == "SELECT";
-    if !is_select {
+    if is_select && scan.has_top_level_from_comma {
+        return Err(PluginError::invalid_params(
+            "Harper cannot execute comma-separated tables in FROM. Join each table using JOIN ... ON matching columns; in the visual query builder, connect every table node.",
+        ));
+    } else if !is_select {
         require_qualified_write_target(&query, kind)?;
     }
     let has_paging_clause = ["limit", "offset", "fetch", "top"]
         .into_iter()
-        .any(|keyword| contains_top_level_keyword(&query, keyword));
+        .any(|keyword| scan.contains_top_level_keyword(keyword));
     let server_paged = is_select && page_size.is_some() && !has_paging_clause;
     let unbounded_needs_server_cap = is_select && page_size.is_none() && !has_paging_clause;
     let executed_query = match (page_size, server_paged, unbounded_needs_server_cap) {
@@ -145,11 +152,9 @@ fn client_with_timeout(params: &Value, timeout: Duration) -> Result<Client, Plug
     Client::connect_with_timeout(ConnectionParams::from_value(inner_params(params)), timeout)
 }
 
+#[cfg(test)]
 fn statement_kind(query: &str) -> Option<&'static str> {
-    let first = scan_sql(query)?.top_level_keywords.into_iter().next()?;
-    ["SELECT", "INSERT", "UPDATE", "DELETE"]
-        .into_iter()
-        .find(|kind| first.eq_ignore_ascii_case(kind))
+    scan_sql(query)?.statement_kind()
 }
 
 fn require_qualified_write_target(query: &str, kind: &str) -> Result<(), PluginError> {
@@ -280,12 +285,9 @@ fn normalized_statement(query: &str) -> Result<String, PluginError> {
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn contains_top_level_keyword(query: &str, expected: &str) -> bool {
-    scan_sql(query).is_some_and(|scan| {
-        scan.top_level_keywords
-            .iter()
-            .any(|keyword| keyword.eq_ignore_ascii_case(expected))
-    })
+    scan_sql(query).is_some_and(|scan| scan.contains_top_level_keyword(expected))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -297,10 +299,35 @@ enum ScanState {
     BlockComment,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopLevelSelectClause {
+    BeforeSelect,
+    SelectList,
+    From,
+    Other,
+    SetOperation,
+}
+
 struct SqlScan {
     semicolons: Vec<usize>,
     last_code_index: Option<usize>,
     top_level_keywords: Vec<String>,
+    has_top_level_from_comma: bool,
+}
+
+impl SqlScan {
+    fn statement_kind(&self) -> Option<&'static str> {
+        let first = self.top_level_keywords.first()?;
+        ["SELECT", "INSERT", "UPDATE", "DELETE"]
+            .into_iter()
+            .find(|kind| first.eq_ignore_ascii_case(kind))
+    }
+
+    fn contains_top_level_keyword(&self, expected: &str) -> bool {
+        self.top_level_keywords
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case(expected))
+    }
 }
 
 fn scan_sql(query: &str) -> Option<SqlScan> {
@@ -309,6 +336,8 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
     let mut semicolons = Vec::new();
     let mut last_code_index = None;
     let mut top_level_keywords = Vec::new();
+    let mut top_level_select_clause = TopLevelSelectClause::BeforeSelect;
+    let mut has_top_level_from_comma = false;
     let mut word = String::new();
     let mut chars = query.char_indices().peekable();
 
@@ -362,13 +391,23 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
             ScanState::Normal => {
                 let next_character = chars.peek().map(|(_, character)| *character);
                 if character == '-' && next_character == Some('-') {
-                    finish_word(&mut word, depth, &mut top_level_keywords);
+                    finish_word(
+                        &mut word,
+                        depth,
+                        &mut top_level_keywords,
+                        &mut top_level_select_clause,
+                    );
                     chars.next();
                     state = ScanState::LineComment;
                     continue;
                 }
                 if character == '/' && next_character == Some('*') {
-                    finish_word(&mut word, depth, &mut top_level_keywords);
+                    finish_word(
+                        &mut word,
+                        depth,
+                        &mut top_level_keywords,
+                        &mut top_level_select_clause,
+                    );
                     chars.next();
                     state = ScanState::BlockComment;
                     continue;
@@ -379,19 +418,39 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                 }
                 match character {
                     '\'' | '"' | '`' => {
-                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        finish_word(
+                            &mut word,
+                            depth,
+                            &mut top_level_keywords,
+                            &mut top_level_select_clause,
+                        );
                         state = ScanState::Quoted(character);
                     }
                     '[' => {
-                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        finish_word(
+                            &mut word,
+                            depth,
+                            &mut top_level_keywords,
+                            &mut top_level_select_clause,
+                        );
                         state = ScanState::Bracketed;
                     }
                     ';' => {
-                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        finish_word(
+                            &mut word,
+                            depth,
+                            &mut top_level_keywords,
+                            &mut top_level_select_clause,
+                        );
                         semicolons.push(index);
                     }
                     '(' => {
-                        finish_word(&mut word, depth, &mut top_level_keywords);
+                        finish_word(
+                            &mut word,
+                            depth,
+                            &mut top_level_keywords,
+                            &mut top_level_select_clause,
+                        );
                         depth = depth.saturating_add(1);
                     }
                     ')' => {
@@ -404,28 +463,82 @@ fn scan_sql(query: &str) -> Option<SqlScan> {
                     {
                         word.push(character);
                     }
-                    _ => finish_word(&mut word, depth, &mut top_level_keywords),
+                    ',' => {
+                        finish_word(
+                            &mut word,
+                            depth,
+                            &mut top_level_keywords,
+                            &mut top_level_select_clause,
+                        );
+                        if depth == 0 && top_level_select_clause == TopLevelSelectClause::From {
+                            has_top_level_from_comma = true;
+                        }
+                    }
+                    _ => finish_word(
+                        &mut word,
+                        depth,
+                        &mut top_level_keywords,
+                        &mut top_level_select_clause,
+                    ),
                 }
             }
         }
     }
-    finish_word(&mut word, depth, &mut top_level_keywords);
+    finish_word(
+        &mut word,
+        depth,
+        &mut top_level_keywords,
+        &mut top_level_select_clause,
+    );
 
     match state {
         ScanState::Normal | ScanState::LineComment => Some(SqlScan {
             semicolons,
             last_code_index,
             top_level_keywords,
+            has_top_level_from_comma,
         }),
         ScanState::Quoted(_) | ScanState::Bracketed | ScanState::BlockComment => None,
     }
 }
 
-fn finish_word(word: &mut String, depth: u32, keywords: &mut Vec<String>) {
+fn finish_word(
+    word: &mut String,
+    depth: u32,
+    keywords: &mut Vec<String>,
+    select_clause: &mut TopLevelSelectClause,
+) {
     if depth == 0 && !word.is_empty() {
+        update_top_level_select_clause(select_clause, word);
         keywords.push(std::mem::take(word));
     } else {
         word.clear();
+    }
+}
+
+fn update_top_level_select_clause(clause: &mut TopLevelSelectClause, word: &str) {
+    if word.eq_ignore_ascii_case("SELECT")
+        && matches!(
+            clause,
+            TopLevelSelectClause::BeforeSelect | TopLevelSelectClause::SetOperation
+        )
+    {
+        *clause = TopLevelSelectClause::SelectList;
+    } else if word.eq_ignore_ascii_case("FROM") && *clause == TopLevelSelectClause::SelectList {
+        *clause = TopLevelSelectClause::From;
+    } else if ["UNION", "EXCEPT", "INTERSECT"]
+        .into_iter()
+        .any(|keyword| word.eq_ignore_ascii_case(keyword))
+    {
+        *clause = TopLevelSelectClause::SetOperation;
+    } else if *clause == TopLevelSelectClause::From
+        && [
+            "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
+        ]
+        .into_iter()
+        .any(|keyword| word.eq_ignore_ascii_case(keyword))
+    {
+        *clause = TopLevelSelectClause::Other;
     }
 }
 
@@ -663,7 +776,7 @@ mod tests {
     use super::{
         bounded_shape, contains_top_level_keyword, normalize_tabularis_multiline_select,
         normalized_statement, quote_tabularis_count_alias, requested_page_size,
-        require_qualified_write_target, statement_kind, tabularis_query_result,
+        require_qualified_write_target, scan_sql, statement_kind, tabularis_query_result,
         unbounded_query_result, write_query_result, MAX_PADDING_CELLS, MAX_RESULT_COLUMNS,
         MAX_UNBOUNDED_ROWS,
     };
@@ -810,6 +923,41 @@ mod tests {
             "SELECT * FROM (SELECT * FROM data.dog LIMIT 10) nested",
             "limit"
         ));
+    }
+
+    #[test]
+    fn detects_only_top_level_commas_in_select_from_clauses() {
+        for query in [
+            "SELECT a.id, b.id FROM data.a a, data.b b",
+            "SELECT a.id, b.id FROM data.a a, data.b b WHERE a.id = b.id",
+            "select a.id, b.id from data.a a, data.b b",
+            "SELECT a.id FROM data.a a INNER JOIN data.b b ON a.id = b.id, data.c c",
+            "SELECT id FROM data.a UNION SELECT id FROM data.b, data.c",
+        ] {
+            assert!(scan_sql(query).unwrap().has_top_level_from_comma, "{query}");
+        }
+
+        for query in [
+            "SELECT a, b FROM data.a",
+            "SELECT CONCAT(a, b) FROM data.a",
+            "SELECT ',' AS punctuation FROM data.a",
+            "SELECT 1, 2",
+            "SELECT * FROM (SELECT * FROM data.a a, data.b b) nested",
+            "SELECT * FROM data.a -- , data.b",
+            "SELECT * FROM data.a /* , data.b */",
+            "SELECT * FROM data.a WHERE id IN (1, 2)",
+            "SELECT a, COUNT(*) FROM data.a GROUP BY a, b",
+            "SELECT a FROM data.a GROUP BY a HAVING COUNT(*) IN (1, 2)",
+            "SELECT * FROM data.a ORDER BY a, b",
+            "SELECT * FROM data.a LIMIT 10, 20",
+            "SELECT * FROM data.a a INNER JOIN data.b b USING (id, tenant_id)",
+            "DELETE FROM data.a WHERE id IN (1, 2)",
+        ] {
+            assert!(
+                !scan_sql(query).unwrap().has_top_level_from_comma,
+                "{query}"
+            );
+        }
     }
 
     #[test]
