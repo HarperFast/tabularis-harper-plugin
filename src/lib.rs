@@ -58,6 +58,14 @@ mod tests {
         assert_eq!(manifest["executable"], env!("CARGO_PKG_NAME"));
         assert_eq!(manifest["capabilities"]["identifier_quote"], "`");
         assert_eq!(manifest["connection_metadata"], true);
+        assert_eq!(
+            manifest["icon"],
+            format!(
+                "https://raw.githubusercontent.com/HarperFast/tabularis-harper-plugin/v{}/harper.png",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert!(manifest["icon"].as_str().unwrap().len() <= 500);
     }
 
     #[test]
