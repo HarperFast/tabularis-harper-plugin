@@ -2,7 +2,7 @@
   "$schema": "https://registry.tabularis.dev/manifest.schema.json?kind=driver",
   "id": "harper",
   "name": "Harper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tabularis driver plugin for Harper",
   "kind": "driver",
   "engine": "harper",

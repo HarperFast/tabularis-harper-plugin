@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "harper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "rustls",
