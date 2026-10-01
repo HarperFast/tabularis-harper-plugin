@@ -92,7 +92,9 @@ The plugin accepts Tabularis's PostgreSQL- and MySQL-style TLS mode names. A bar
 
 ## Publishing
 
-Tag a commit `v0.1.0` and push — the included GitHub Actions workflow builds for Linux (x64/arm64), macOS (x64/arm64), and Windows (x64), then attaches the zipped plugin bundles to the release. Submit a PR to `plugins/registry.json` in the Tabularis repo to publish to the in-app registry.
+After CI passes, tag the commit `v0.1.0` and push the tag. The tag without its `v` prefix must match the version in `.tabularium`. The included GitHub Actions workflow builds for Linux (x64/arm64), macOS (x64/arm64), and Windows (x64), then attaches the zipped plugin bundles and standalone manifest to the release.
+
+Submit the released plugin through [registry.tabularis.dev/submit](https://registry.tabularis.dev/submit) to publish it to the in-app registry.
 
 ## References
 

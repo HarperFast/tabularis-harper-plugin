@@ -51,8 +51,10 @@ mod tests {
     fn manifest_preserves_harper_runtime_identity() {
         let manifest: Value = serde_json::from_str(include_str!("../.tabularium")).unwrap();
 
-        assert_eq!(manifest["name"], "harper");
+        assert_eq!(manifest["id"], "harper");
+        assert_eq!(manifest["name"], "Harper");
         assert_eq!(manifest["engine"], "harper");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(manifest["executable"], env!("CARGO_PKG_NAME"));
         assert_eq!(manifest["capabilities"]["identifier_quote"], "`");
         assert_eq!(manifest["connection_metadata"], true);
